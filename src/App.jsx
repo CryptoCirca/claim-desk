@@ -18,8 +18,8 @@ const C = {
   sub: "#6E7268",
   line: "#DCD8CB",
   card: "#FFFFFF",
-  teal: "#136A57",
-  tealSoft: "#E2EFEA",
+  teal: "var(--accent, #136A57)",
+  tealSoft: "var(--accent-soft, #E2EFEA)",
   amber: "#9A6A00",
   amberSoft: "#F7EDD3",
   red: "#A83A2C",
@@ -60,6 +60,9 @@ const isStaffRole = (r) => r === "superadmin" || r === "claimadmin" || r === "ad
 
 const defaultSettings = () => ({
   storeName: "Claim Desk",
+  logo: null,
+  accentColor: "#136A57",
+  headerColor: "#22271F",
   paymentInstructions: "Bank transfer — BSB 000-000, Account 1234 5678, Name: Your Store. Use your claim reference as the transfer description, or pay in store.",
   defaultDeposit: 10,
   defaultPaymentHours: 24,
@@ -161,6 +164,28 @@ const money = (n) => "$" + Number(n || 0).toFixed(2).replace(/\.00$/, "");
 const fmtDT = (iso) => (iso ? new Date(iso).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : "—");
 const payRef = (code) => `CLM-${code}-${uid().slice(0, 4)}`;
 const nowISO = () => new Date().toISOString();
+
+/* ---------- theme helpers ---------- */
+function softColor(hex) {
+  const m = /^#?([\da-fA-F]{6})$/.exec(hex || "");
+  if (!m) return "#E2EFEA";
+  const n = parseInt(m[1], 16);
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, 0.14)`;
+}
+function isLightColor(hex) {
+  const m = /^#?([\da-fA-F]{6})$/.exec(hex || "");
+  if (!m) return false;
+  const n = parseInt(m[1], 16);
+  return 0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255) > 150;
+}
+const THEME_PRESETS = [
+  { name: "Forest", accent: "#136A57", header: "#22271F" },
+  { name: "Ruby", accent: "#B3372E", header: "#2B1A18" },
+  { name: "Ocean", accent: "#1D5FA8", header: "#152436" },
+  { name: "Violet", accent: "#6A4FB6", header: "#241D33" },
+  { name: "Amber", accent: "#9A6A00", header: "#2A2214" },
+  { name: "Noir", accent: "#4A524C", header: "#101210" },
+];
 
 function timeLeft(iso) {
   if (!iso) return "";
@@ -683,8 +708,19 @@ export default function App() {
 
   const me = session ? users.find((u) => u.id === session.userId) : null;
 
+  const accent = settings.accentColor || "#136A57";
+  const headerBg = settings.headerColor || "#22271F";
+  const lightHeader = isLightColor(headerBg);
+
   return (
-    <div style={{ minHeight: "100vh", background: C.bg, color: C.ink, fontFamily: "system-ui, -apple-system, sans-serif" }}>
+    <div style={{
+      minHeight: "100vh", background: C.bg, color: C.ink, fontFamily: "system-ui, -apple-system, sans-serif",
+      "--accent": accent,
+      "--accent-soft": softColor(accent),
+      "--header": headerBg,
+      "--header-text": lightHeader ? "#22271F" : "#F1EFE9",
+      "--header-line": lightHeader ? "rgba(0,0,0,0.3)" : "rgba(255,255,255,0.3)",
+    }}>
       {toast && (
         <div style={{ position: "fixed", bottom: 20, left: "50%", transform: "translateX(-50%)", background: C.ink, color: "#F1EFE9", padding: "10px 18px", borderRadius: 10, fontSize: 14, zIndex: 90, boxShadow: "0 8px 24px rgba(0,0,0,0.25)" }}>
           {toast}
@@ -699,7 +735,7 @@ export default function App() {
             onAuth={() => setWantAuth(true)}
           />
         ) : (
-          <AuthScreen actions={actions} />
+          <AuthScreen actions={actions} settings={settings} />
         )
       ) : me.status !== "approved" ? (
         <PendingScreen me={me} actions={actions} />
@@ -729,7 +765,7 @@ function PublicEventPage({ ev, claims, settings, onAuth }) {
 
   return (
     <div>
-      <Header brand={settings.storeName} title={visible ? ev.title : "Claim event"} sub="Shared claim event" right={<Btn kind="ghost" small style={{ borderColor: "rgba(255,255,255,0.3)", color: "#F1EFE9" }} onClick={onAuth}>Sign in</Btn>} />
+      <Header logo={settings.logo} brand={settings.storeName} title={visible ? ev.title : "Claim event"} sub="Shared claim event" right={<Btn kind="ghost" small style={{ borderColor: "var(--header-line, rgba(255,255,255,0.3))", color: "var(--header-text, #F1EFE9)" }} onClick={onAuth}>Sign in</Btn>} />
       <div style={{ maxWidth: 720, margin: "0 auto", padding: 20 }}>
         {!visible ? (
           <Card style={{ textAlign: "center", padding: 32 }}>
@@ -798,14 +834,17 @@ function PublicEventPage({ ev, claims, settings, onAuth }) {
 /* ============================================================
    AUTH
    ============================================================ */
-function Header({ title, sub, right, brand = "Claim Desk" }) {
+function Header({ title, sub, right, brand = "Claim Desk", logo = null }) {
   return (
-    <div style={{ background: C.ink, color: "#F1EFE9", padding: "18px 20px" }}>
+    <div style={{ background: "var(--header, #22271F)", color: "var(--header-text, #F1EFE9)", padding: "18px 20px" }}>
       <div style={{ maxWidth: 1080, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
-        <div>
-          <div style={{ fontSize: 11, letterSpacing: "0.18em", textTransform: "uppercase", opacity: 0.65 }}>{brand}</div>
-          <div style={{ fontSize: 20, fontWeight: 700 }}>{title}</div>
-          {sub && <div style={{ fontSize: 13, opacity: 0.7, marginTop: 2 }}>{sub}</div>}
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          {logo && <img src={logo} alt={brand} style={{ height: 44, maxWidth: 150, objectFit: "contain" }} />}
+          <div>
+            <div style={{ fontSize: 11, letterSpacing: "0.18em", textTransform: "uppercase", opacity: 0.65 }}>{brand}</div>
+            <div style={{ fontSize: 20, fontWeight: 700 }}>{title}</div>
+            {sub && <div style={{ fontSize: 13, opacity: 0.7, marginTop: 2 }}>{sub}</div>}
+          </div>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>{right}</div>
       </div>
@@ -813,7 +852,7 @@ function Header({ title, sub, right, brand = "Claim Desk" }) {
   );
 }
 
-function AuthScreen({ actions }) {
+function AuthScreen({ actions, settings }) {
   const [mode, setMode] = useState("login");
   const [f, setF] = useState({ name: "", email: "", mobile: "", pay: "Bank transfer", notes: "", pin: "", agree: false });
   const [login, setLogin] = useState({ email: "", pin: "" });
@@ -838,10 +877,14 @@ function AuthScreen({ actions }) {
     <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", padding: 20 }}>
       <div style={{ width: "100%", maxWidth: 440 }}>
         <div style={{ textAlign: "center", marginBottom: 22 }}>
-          <div style={{ display: "inline-flex", gap: 6, marginBottom: 10 }}>
-            <Tag code="A1" /> <Tag code="B4" dark={false} />
-          </div>
-          <div style={{ fontSize: 26, fontWeight: 800, letterSpacing: "-0.02em" }}>Claim Desk</div>
+          {settings?.logo ? (
+            <img src={settings.logo} alt={settings.storeName} style={{ height: 64, maxWidth: 220, objectFit: "contain", marginBottom: 10 }} />
+          ) : (
+            <div style={{ display: "inline-flex", gap: 6, marginBottom: 10 }}>
+              <Tag code="A1" /> <Tag code="B4" dark={false} />
+            </div>
+          )}
+          <div style={{ fontSize: 26, fontWeight: 800, letterSpacing: "-0.02em" }}>{settings?.storeName || "Claim Desk"}</div>
           <div style={{ color: C.sub, fontSize: 14 }}>Claim products from the drop photo. Pay your deposit. Collect in store.</div>
         </div>
 
@@ -926,11 +969,11 @@ function CustomerApp({ me, events, claims, settings, actions, initialEventId }) 
 
   return (
     <>
-      <Header
+      <Header logo={settings.logo}
         brand={settings.storeName}
         title={`Hi, ${me.name.split(" ")[0]}`}
         sub="Approved customer"
-        right={<Btn kind="ghost" small style={{ borderColor: "rgba(255,255,255,0.3)", color: "#F1EFE9" }} onClick={actions.logout}>Sign out</Btn>}
+        right={<Btn kind="ghost" small style={{ borderColor: "var(--header-line, rgba(255,255,255,0.3))", color: "var(--header-text, #F1EFE9)" }} onClick={actions.logout}>Sign out</Btn>}
       />
       <div style={{ maxWidth: 1080, margin: "0 auto", padding: 20 }}>
         <div style={{ display: "flex", gap: 8, marginBottom: 18 }}>
@@ -1162,14 +1205,14 @@ function AdminApp({ me, users, events, claims, audit, settings, actions }) {
   ];
   return (
     <>
-      <Header
+      <Header logo={settings.logo}
         brand={settings.storeName}
         title="Admin dashboard"
         sub={`${me.name} · ${STAFF_ROLES[me.role] || "Staff"}`}
         right={
           <>
-            <Btn kind="ghost" small style={{ borderColor: "rgba(255,255,255,0.3)", color: "#F1EFE9" }} onClick={actions.reload}>Refresh</Btn>
-            <Btn kind="ghost" small style={{ borderColor: "rgba(255,255,255,0.3)", color: "#F1EFE9" }} onClick={actions.logout}>Sign out</Btn>
+            <Btn kind="ghost" small style={{ borderColor: "var(--header-line, rgba(255,255,255,0.3))", color: "var(--header-text, #F1EFE9)" }} onClick={actions.reload}>Refresh</Btn>
+            <Btn kind="ghost" small style={{ borderColor: "var(--header-line, rgba(255,255,255,0.3))", color: "var(--header-text, #F1EFE9)" }} onClick={actions.logout}>Sign out</Btn>
           </>
         }
       />
@@ -1635,8 +1678,68 @@ function SettingsTab({ settings, users, actions, me }) {
     cancelled: "Claim cancelled",
   };
 
+  const logoRef = useRef(null);
+  const onLogo = (file) => {
+    if (!file) return;
+    const rd = new FileReader();
+    rd.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const scale = Math.min(1, 160 / img.height, 500 / img.width);
+        const cv = document.createElement("canvas");
+        cv.width = Math.round(img.width * scale);
+        cv.height = Math.round(img.height * scale);
+        cv.getContext("2d").drawImage(img, 0, 0, cv.width, cv.height);
+        const data = cv.toDataURL("image/png"); // PNG keeps transparency
+        if (data.length > 600000) setMsg("That logo is too large — try a simpler or smaller image.");
+        else setS((cur) => ({ ...cur, logo: data }));
+      };
+      img.src = rd.result;
+    };
+    rd.readAsDataURL(file);
+  };
+
   return (
     <div style={{ display: "grid", gap: 14 }}>
+      <Card>
+        <div style={{ fontWeight: 800, marginBottom: 4 }}>Branding & theme</div>
+        <div style={{ fontSize: 13, color: C.sub, marginBottom: 12 }}>
+          The logo and colors apply everywhere — the sign-in page, customer dashboard, admin dashboard, and the public event pages you share on WhatsApp or Discord.
+        </div>
+        <Field label="Store logo" hint="PNG with a transparent background looks best. Resized automatically.">
+          <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+            {s.logo && (
+              <span style={{ background: s.headerColor || "#22271F", padding: "8px 14px", borderRadius: 8, display: "inline-flex" }}>
+                <img src={s.logo} alt="" style={{ height: 44, maxWidth: 150, objectFit: "contain" }} />
+              </span>
+            )}
+            <input ref={logoRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => onLogo(e.target.files[0])} />
+            <Btn kind="ghost" small onClick={() => logoRef.current.click()}>{s.logo ? "Replace logo" : "Upload logo"}</Btn>
+            {s.logo && <Btn kind="danger" small onClick={() => setS({ ...s, logo: null })}>Remove</Btn>}
+          </div>
+        </Field>
+        <div style={{ display: "grid", gap: 12, gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))" }}>
+          <Field label="Accent color" hint="Buttons, live badges, confirmations, links.">
+            <input type="color" value={s.accentColor || "#136A57"} onChange={(e) => setS({ ...s, accentColor: e.target.value })} style={{ width: "100%", height: 40, border: `1.5px solid ${C.line}`, borderRadius: 8, background: "#fff", cursor: "pointer" }} />
+          </Field>
+          <Field label="Header color" hint="Top banner on every page. Text adjusts automatically for contrast.">
+            <input type="color" value={s.headerColor || "#22271F"} onChange={(e) => setS({ ...s, headerColor: e.target.value })} style={{ width: "100%", height: 40, border: `1.5px solid ${C.line}`, borderRadius: 8, background: "#fff", cursor: "pointer" }} />
+          </Field>
+        </div>
+        <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: C.sub, margin: "6px 0 8px" }}>Quick themes</div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
+          {THEME_PRESETS.map((t) => (
+            <button key={t.name} onClick={() => setS({ ...s, accentColor: t.accent, headerColor: t.header })}
+              style={{ display: "flex", gap: 8, alignItems: "center", padding: "6px 12px", borderRadius: 99, border: `1.5px solid ${C.line}`, background: "#fff", cursor: "pointer", fontSize: 13, fontWeight: 600, color: C.ink }}>
+              <span style={{ width: 14, height: 14, borderRadius: "50%", background: t.header, display: "inline-block" }} />
+              <span style={{ width: 14, height: 14, borderRadius: "50%", background: t.accent, display: "inline-block" }} />
+              {t.name}
+            </button>
+          ))}
+        </div>
+        <Btn onClick={() => actions.saveSettings(s, me.name)}>Save branding</Btn>
+      </Card>
+
       <Card>
         <div style={{ fontWeight: 800, marginBottom: 12 }}>Store & payment settings</div>
         <Field label="Store name" hint="Shown in the header for staff and customers.">

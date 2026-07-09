@@ -85,6 +85,9 @@ const REMOTE = {
   anonKey: "", // the long "anon public" key
 };
 
+// Show the demo sign-in hints on the login screen (set true for internal testing)
+const SHOW_DEMO_LOGINS = false;
+
 const hasRemote = () => REMOTE.url && REMOTE.anonKey;
 const remoteHeaders = () => ({
   apikey: REMOTE.anonKey,
@@ -907,9 +910,11 @@ function AuthScreen({ actions, settings }) {
                 New customer?{" "}
                 <a onClick={() => { setMode("register"); setMsg(null); }} style={{ color: C.teal, fontWeight: 600, cursor: "pointer" }}>Create an account</a>
               </div>
-              <div style={{ marginTop: 16, padding: 10, background: C.bg, borderRadius: 8, fontSize: 12, color: C.sub }}>
-                <b>Demo sign-ins</b> — Admin: <span style={{ fontFamily: C.mono }}>admin / 1234</span> · Sample customer (pending): <span style={{ fontFamily: C.mono }}>sam@example.com / 1111</span>
-              </div>
+              {SHOW_DEMO_LOGINS && (
+                <div style={{ marginTop: 16, padding: 10, background: C.bg, borderRadius: 8, fontSize: 12, color: C.sub }}>
+                  <b>Demo sign-ins</b> — Admin: <span style={{ fontFamily: C.mono }}>admin / 1234</span> · Sample customer (pending): <span style={{ fontFamily: C.mono }}>sam@example.com / 1111</span>
+                </div>
+              )}
             </>
           ) : (
             <>

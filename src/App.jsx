@@ -44,9 +44,13 @@ const PAY_META = {
   received: { label: "Payment received", fg: C.teal },
   overdue: { label: "Payment overdue", fg: C.red },
   refunded: { label: "Refunded", fg: C.slate },
+  forfeited: { label: "Deposit forfeited", fg: C.red },
   cancelled: { label: "Cancelled", fg: C.sub },
 };
 const HOLDS_STOCK = ["awaiting_deposit", "deposit_received", "confirmed", "ready", "collected"];
+// statuses that count toward per-customer claim limits (waitlist spots count too,
+// so limits can't be gamed by joining the waitlist)
+const COUNTS_FOR_LIMITS = [...HOLDS_STOCK, "waitlisted"];
 
 /* ---------- storage helpers ---------- */
 const K = { users: "pcs:users", events: "pcs:events", claims: "pcs:claims", audit: "pcs:audit", settings: "pcs:settings" };
@@ -175,6 +179,110 @@ const heldQty = (claims, eventId, code) =>
     .filter((c) => c.eventId === eventId && c.code === code && HOLDS_STOCK.includes(c.status))
     .reduce((s, c) => s + c.qty, 0);
 
+/* ---------- customer reliability ---------- */
+const CUSTOMER_GROUPS = { standard: "Standard", vip: "VIP", staff: "Staff" };
+
+function scoreStats(userId, claims) {
+  const mine = claims.filter((c) => c.userId === userId);
+  return {
+    collected: mine.filter((c) => c.status === "collected").length,
+    cancelled: mine.filter((c) => c.status === "cancelled" && c.cancelledBy === "customer").length,
+    expired: mine.filter((c) => c.status === "expired").length,
+    noShows: mine.filter((c) => c.noShow).length,
+    late: mine.filter((c) => c.paidLate).length,
+  };
+}
+function scoreFor(user, claims) {
+  const s = scoreStats(user.id, claims);
+  const raw = 100 + 2 * s.collected - 5 * s.cancelled - 10 * s.expired - 15 * s.noShows - 3 * s.late + (+user.scoreAdj || 0);
+  return Math.max(0, Math.min(100, Math.round(raw)));
+}
+
+/* ---------- allocation rules ---------- */
+const defaultRules = () => ({
+  maxItemsPerCustomer: 0, // 0 = no limit (whole event)
+  minScore: 0,            // 0 = off
+  minAccountDays: 0,      // 0 = off
+  earlyAccess: { enabled: false, minutes: 30, groups: ["vip", "staff"] },
+});
+
+// Checks whether a customer may claim this product right now.
+// Returns { ok: true, maxQty } or { ok: false, msg }.
+function claimEligibility(user, ev, product, claims) {
+  const rules = { ...defaultRules(), ...(ev.rules || {}) };
+  const group = user.group || "standard";
+  if (rules.earlyAccess && rules.earlyAccess.enabled) {
+    const end = new Date(ev.opensAt).getTime() + (+rules.earlyAccess.minutes || 0) * 60000;
+    if (Date.now() < end && !(rules.earlyAccess.groups || []).includes(group))
+      return { ok: false, msg: `Early access until ${fmtDT(new Date(end).toISOString())} — opens to everyone after that` };
+  }
+  if ((+rules.minAccountDays || 0) > 0 && user.createdAt) {
+    const days = (Date.now() - new Date(user.createdAt)) / 86400e3;
+    if (days < +rules.minAccountDays)
+      return { ok: false, msg: `Available to accounts at least ${rules.minAccountDays} days old` };
+  }
+  if ((+rules.minScore || 0) > 0 && scoreFor(user, claims) < +rules.minScore)
+    return { ok: false, msg: "This event has claim requirements your account does not currently meet — contact the store if unsure" };
+  const mine = claims.filter((c) => c.eventId === ev.id && c.userId === user.id && COUNTS_FOR_LIMITS.includes(c.status));
+  const myTotal = mine.reduce((s, c) => s + c.qty, 0);
+  const evMax = +rules.maxItemsPerCustomer || 0;
+  if (evMax > 0 && myTotal >= evMax)
+    return { ok: false, msg: `Limit of ${evMax} item${evMax > 1 ? "s" : ""} per customer for this event` };
+  const myProd = mine.filter((c) => c.code === product.code).reduce((s, c) => s + c.qty, 0);
+  const pMax = +product.maxPerCustomer || 0;
+  if (pMax > 0 && myProd >= pMax) return { ok: false, msg: `Limit ${pMax} per customer` };
+  const excl = (product.excludeIfClaimed || "").trim().toUpperCase();
+  if (excl && mine.some((c) => c.code === excl))
+    return { ok: false, msg: `Not available if you have claimed ${excl}` };
+  const maxQty = Math.min(evMax > 0 ? evMax - myTotal : Infinity, pMax > 0 ? pMax - myProd : Infinity);
+  return { ok: true, maxQty };
+}
+
+/* ---------- waitlist ordering ---------- */
+const byWaitlistOrder = (a, b) => (a.waitlistOrder || a.claimedAt).localeCompare(b.waitlistOrder || b.claimedAt);
+const waitlistQueue = (claims, eventId, code) =>
+  claims.filter((c) => c.eventId === eventId && c.code === code && c.status === "waitlisted").sort(byWaitlistOrder);
+function waitlistPosition(claim, claims) {
+  const q = waitlistQueue(claims, claim.eventId, claim.code);
+  return { pos: q.findIndex((c) => c.id === claim.id) + 1, total: q.length };
+}
+
+/* ---------- automatic expiry & promotion sweep ----------
+   Runs on every data refresh. Expires unpaid reservations past their
+   deadline (per event setting), returns the stock, and promotes the
+   waitlist in strict first-come-first-served order (per event setting). */
+function runMaintenance(events, claims) {
+  const out = claims.map((c) => ({ ...c }));
+  const audits = [];
+  let changed = false;
+  const evById = Object.fromEntries(events.map((e) => [e.id, e]));
+
+  for (const c of out) {
+    const ev = evById[c.eventId];
+    if (!ev || !ev.autoExpire) continue;
+    if (c.status === "awaiting_deposit" && c.paymentStatus === "awaiting" && c.deadline && new Date(c.deadline) < Date.now()) {
+      c.status = "expired"; c.paymentStatus = "overdue"; changed = true;
+      audits.push({ ts: nowISO(), actor: "System", action: "Reservation auto-expired", detail: `${c.code} ×${c.qty} — ${c.customer} (${c.ref})` });
+    }
+  }
+  for (const ev of events) {
+    if (!ev.autoPromote) continue;
+    for (const p of ev.products || []) {
+      let held = out.filter((c) => c.eventId === ev.id && c.code === p.code && HOLDS_STOCK.includes(c.status)).reduce((s, c) => s + c.qty, 0);
+      const queue = out.filter((c) => c.eventId === ev.id && c.code === p.code && c.status === "waitlisted").sort(byWaitlistOrder);
+      for (const w of queue) {
+        if (held + w.qty > p.qty) break; // strict first-come-first-served: never jump the queue
+        w.status = "awaiting_deposit";
+        w.deadline = new Date(Date.now() + (ev.paymentHours || 24) * 3600e3).toISOString();
+        w.promoted = true; w.promotedAt = nowISO();
+        held += w.qty; changed = true;
+        audits.push({ ts: nowISO(), actor: "System", action: "Auto-promoted from waitlist", detail: `${w.code} ×${w.qty} — ${w.customer} (${w.ref})` });
+      }
+    }
+  }
+  return { claims: out, audits, changed };
+}
+
 /* ---------- seed data ---------- */
 const seedImage = () => {
   const cells = [
@@ -197,27 +305,30 @@ const seedImage = () => {
 function seedData() {
   const t = Date.now();
   const users = [
-    { id: "admin", role: "superadmin", name: "Store Admin", email: "admin", mobile: "", pay: "", notes: "", pin: "1234", status: "approved", createdAt: nowISO() },
-    { id: "u-demo", role: "customer", name: "Sam Lee", email: "sam@example.com", mobile: "0400 000 111", pay: "Bank transfer", notes: "", pin: "1111", status: "pending", createdAt: nowISO() },
+    { id: "admin", role: "superadmin", name: "Store Admin", email: "admin", mobile: "", pay: "", notes: "", pin: "1234", status: "approved", group: "staff", createdAt: nowISO() },
+    { id: "u-demo", role: "customer", name: "Sam Lee", email: "sam@example.com", mobile: "0400 000 111", pay: "Bank transfer", notes: "", pin: "1111", status: "pending", group: "standard", createdAt: nowISO() },
   ];
   const events = [
     {
       id: "ev-demo",
       title: "Saturday Drop #14",
-      description: "First in, first served. Claim your codes from the photo, then transfer your deposit within the payment window to lock it in.",
+      description: "First in, first served. Claim your codes from the photo, then transfer your deposit within the payment window to lock it in. Limit 3 items per customer; booster boxes limited to 1 each.",
       image: seedImage(),
       products: [
-        { code: "A1", name: "Variegated Monstera — small", price: 120, deposit: 10, qty: 2 },
-        { code: "A2", name: "Philodendron Pink Princess", price: 95, deposit: 10, qty: 3 },
-        { code: "A3", name: "Anthurium Clarinervium", price: 80, deposit: 10, qty: 1 },
-        { code: "B1", name: "Hoya Krimson Queen", price: 45, deposit: 10, qty: 4 },
-        { code: "B2", name: "Alocasia Frydek", price: 60, deposit: 10, qty: 2 },
-        { code: "B3", name: "Syngonium Albo cutting", price: 35, deposit: 10, qty: 5 },
+        { code: "A1", name: "Scarlet & Violet Booster Box (sealed)", price: 250, deposit: 20, qty: 2, maxPerCustomer: 1, excludeIfClaimed: "" },
+        { code: "A2", name: "Elite Trainer Box", price: 85, deposit: 10, qty: 4, maxPerCustomer: 2, excludeIfClaimed: "" },
+        { code: "A3", name: "Ultra Premium Collection", price: 180, deposit: 20, qty: 1, maxPerCustomer: 1, excludeIfClaimed: "A1" },
+        { code: "B1", name: "One Piece OP-09 Booster Box", price: 140, deposit: 15, qty: 3, maxPerCustomer: 1, excludeIfClaimed: "" },
+        { code: "B2", name: "Lorcana Illumineer's Trove", price: 75, deposit: 10, qty: 2, maxPerCustomer: 1, excludeIfClaimed: "" },
+        { code: "B3", name: "MTG Play Booster Box", price: 160, deposit: 15, qty: 2, maxPerCustomer: 1, excludeIfClaimed: "" },
       ],
       opensAt: new Date(t - 3600e3).toISOString(),
       closesAt: new Date(t + 48 * 3600e3).toISOString(),
       paymentHours: 24,
       waitlist: true,
+      autoExpire: true,
+      autoPromote: true,
+      rules: { ...defaultRules(), maxItemsPerCustomer: 3 },
       published: true,
       createdAt: nowISO(),
     },
@@ -326,7 +437,18 @@ export default function App() {
       let usersList = u.map((x) => (x.role === "admin" ? { ...x, role: "superadmin" } : x));
       if (!usersList.some((x) => x.id === "admin")) usersList = [seedData().users[0], ...usersList];
       if (JSON.stringify(usersList) !== JSON.stringify(u)) await saveKey(K.users, usersList);
-      setUsers(usersList); setEvents(e || []); setClaims(c || []); setAudit(a || []);
+      setUsers(usersList); setEvents(e || []);
+
+      // automatic reservation expiry + waitlist promotion
+      const maint = runMaintenance(e || [], c || []);
+      if (maint.changed) {
+        const nextAudit = [...maint.audits, ...(a || [])].slice(0, 500);
+        await saveKey(K.claims, maint.claims);
+        await saveKey(K.audit, nextAudit);
+        setClaims(maint.claims); setAudit(nextAudit);
+      } else {
+        setClaims(c || []); setAudit(a || []);
+      }
     }
   }, []);
 
@@ -439,6 +561,13 @@ export default function App() {
     async placeClaim(user, ev, product, qty) {
       let result = { ok: false, msg: "Something went wrong." };
       await mutate(K.claims, setClaims, (cs) => {
+        // allocation rules are checked against fresh data at the moment of claiming
+        const elig = claimEligibility(user, ev, product, cs);
+        if (!elig.ok) { result = { ok: false, msg: elig.msg }; return undefined; }
+        if (elig.maxQty !== Infinity && qty > elig.maxQty) {
+          result = { ok: false, msg: `You can claim at most ${elig.maxQty} more of this within your limits.` };
+          return undefined;
+        }
         const avail = product.qty - heldQty(cs, ev.id, product.code);
         const base = {
           id: "c-" + uid(), eventId: ev.id, eventTitle: ev.title, userId: user.id,
@@ -456,7 +585,7 @@ export default function App() {
           return [claim, ...cs];
         }
         if (ev.waitlist) {
-          const claim = { ...base, status: "waitlisted", paymentStatus: "awaiting", deadline: null };
+          const claim = { ...base, status: "waitlisted", paymentStatus: "awaiting", deadline: null, waitlistOrder: nowISO() };
           result = { ok: "wait", claim };
           return [claim, ...cs];
         }
@@ -484,11 +613,36 @@ export default function App() {
         ok = true;
         return cs.map((c) =>
           c.id === claim.id
-            ? { ...c, status: "awaiting_deposit", deadline: new Date(Date.now() + (ev.paymentHours || 24) * 3600e3).toISOString() }
+            ? { ...c, status: "awaiting_deposit", promoted: true, promotedAt: nowISO(), deadline: new Date(Date.now() + (ev.paymentHours || 24) * 3600e3).toISOString() }
             : c
         );
       });
       if (ok) { await addAudit(actorName, "Promoted from waitlist", `${claim.code} — ${claim.customer}`); notify("Moved to confirmed queue — awaiting deposit"); }
+    },
+
+    async moveWaitlist(claim, dir, actorName) {
+      let moved = false;
+      await mutate(K.claims, setClaims, (cs) => {
+        const q = waitlistQueue(cs, claim.eventId, claim.code);
+        const i = q.findIndex((c) => c.id === claim.id);
+        const j = i + dir;
+        if (i < 0 || j < 0 || j >= q.length) return undefined;
+        const a = q[i], b = q[j];
+        const ao = a.waitlistOrder || a.claimedAt, bo = b.waitlistOrder || b.claimedAt;
+        moved = true;
+        return cs.map((c) => (c.id === a.id ? { ...c, waitlistOrder: bo } : c.id === b.id ? { ...c, waitlistOrder: ao } : c));
+      });
+      if (moved) await addAudit(actorName, "Waitlist reordered", `${claim.code} — ${claim.customer} moved ${dir < 0 ? "up" : "down"}`);
+    },
+    async setUserGroup(target, group, actorName) {
+      await mutate(K.users, setUsers, (us) => us.map((u) => (u.id === target.id ? { ...u, group } : u)));
+      await addAudit(actorName, "Customer group changed", `${target.name} → ${CUSTOMER_GROUPS[group] || group}`);
+      notify(`${target.name} is now ${CUSTOMER_GROUPS[group] || group}`);
+    },
+    async setUserScoreAdj(target, adj, actorName) {
+      await mutate(K.users, setUsers, (us) => us.map((u) => (u.id === target.id ? { ...u, scoreAdj: adj } : u)));
+      await addAudit(actorName, "Reliability score adjusted", `${target.name}: manual adjustment ${adj >= 0 ? "+" : ""}${adj}`);
+      notify("Score adjustment saved");
     },
     reload: reloadAll,
     notify,
@@ -675,7 +829,7 @@ function CustomerApp({ me, events, claims, settings, actions }) {
           </>
         )}
         {tab === "events" && ev && <EventDetail ev={ev} me={me} claims={claims} settings={settings} actions={actions} onBack={() => setOpenEvent(null)} goClaims={() => setTab("claims")} />}
-        {tab === "claims" && <MyClaims mine={mine} events={events} settings={settings} actions={actions} me={me} />}
+        {tab === "claims" && <MyClaims mine={mine} claims={claims} settings={settings} actions={actions} me={me} />}
       </div>
     </>
   );
@@ -753,8 +907,28 @@ function EventDetail({ ev, me, claims, settings, actions, onBack, goClaims }) {
           <div style={{ padding: "12px 16px", borderBottom: `1px solid ${C.line}`, fontSize: 11, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: C.sub }}>
             Product list — match the codes on the photo
           </div>
+          {(() => {
+            const r = { ...defaultRules(), ...(ev.rules || {}) };
+            if (!r.earlyAccess.enabled) return null;
+            const end = new Date(ev.opensAt).getTime() + (+r.earlyAccess.minutes || 0) * 60000;
+            if (Date.now() >= end) return null;
+            const names = (r.earlyAccess.groups || []).map((g) => CUSTOMER_GROUPS[g] || g).join(" & ");
+            const isIn = (r.earlyAccess.groups || []).includes(me.group || "standard");
+            return (
+              <div style={{ padding: "10px 16px", borderBottom: `1px solid ${C.line}`, background: isIn ? C.tealSoft : C.amberSoft, fontSize: 13, fontWeight: 600, color: isIn ? C.teal : C.amber }}>
+                {isIn ? `${names} early access is live for you now` : `${names} early access until ${fmtDT(new Date(end).toISOString())} — claiming opens to everyone after that`}
+              </div>
+            );
+          })()}
+          {ev.rules && +ev.rules.maxItemsPerCustomer > 0 && (
+            <div style={{ padding: "8px 16px", borderBottom: `1px solid ${C.line}`, fontSize: 12, color: C.sub }}>
+              Limit {ev.rules.maxItemsPerCustomer} item{+ev.rules.maxItemsPerCustomer > 1 ? "s" : ""} per customer across this event.
+            </div>
+          )}
           {ev.products.map((p) => {
             const left = Math.max(0, p.qty - heldQty(claims, ev.id, p.code));
+            const wl = waitlistQueue(claims, ev.id, p.code).length;
+            const elig = claimEligibility(me, ev, p, claims);
             const isSel = sel === p.code;
             return (
               <div key={p.code} style={{ padding: "12px 16px", borderBottom: `1px solid ${C.line}`, background: isSel ? C.bg : "transparent" }}>
@@ -762,12 +936,16 @@ function EventDetail({ ev, me, claims, settings, actions, onBack, goClaims }) {
                   <Tag code={p.code} />
                   <div style={{ flex: 1, minWidth: 160 }}>
                     <div style={{ fontWeight: 600 }}>{p.name}</div>
-                    <div style={{ fontSize: 13, color: C.sub }}>{money(p.price)} · deposit {money(p.deposit)} each</div>
+                    <div style={{ fontSize: 13, color: C.sub }}>
+                      {money(p.price)} · deposit {money(p.deposit)} each
+                      {+p.maxPerCustomer > 0 && <> · limit {p.maxPerCustomer}/customer</>}
+                    </div>
+                    {!elig.ok && <div style={{ fontSize: 12, color: C.amber, fontWeight: 600, marginTop: 2 }}>{elig.msg}</div>}
                   </div>
                   <div style={{ fontSize: 13, fontWeight: 700, color: left > 0 ? C.teal : C.red }}>
-                    {left > 0 ? `${left} left` : ev.waitlist ? "Sold out · waitlist open" : "Sold out"}
+                    {left > 0 ? `${left} left` : ev.waitlist ? `Sold out · ${wl} waiting` : "Sold out"}
                   </div>
-                  <Btn small kind={left > 0 ? "primary" : "ghost"} disabled={left <= 0 && !ev.waitlist}
+                  <Btn small kind={left > 0 ? "primary" : "ghost"} disabled={!elig.ok || (left <= 0 && !ev.waitlist)}
                     onClick={() => { setSel(isSel ? null : p.code); setQty(1); setErr(null); setPlaced(null); }}>
                     {isSel ? "Close" : left > 0 ? "Claim" : "Join waitlist"}
                   </Btn>
@@ -777,7 +955,9 @@ function EventDetail({ ev, me, claims, settings, actions, onBack, goClaims }) {
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                       <Btn small kind="ghost" onClick={() => setQty(Math.max(1, qty - 1))}>−</Btn>
                       <span style={{ fontFamily: C.mono, fontWeight: 700, fontSize: 16, minWidth: 24, textAlign: "center" }}>{qty}</span>
-                      <Btn small kind="ghost" onClick={() => setQty(Math.min(Math.max(avail, 1), qty + 1))} disabled={avail > 0 && qty >= avail}>+</Btn>
+                      <Btn small kind="ghost"
+                        onClick={() => setQty(qty + 1)}
+                        disabled={(avail > 0 && qty >= avail) || (elig.ok && elig.maxQty !== Infinity && qty >= elig.maxQty)}>+</Btn>
                     </div>
                     <div style={{ fontSize: 14 }}>
                       Deposit required: <b>{money(p.deposit * qty)}</b>
@@ -796,12 +976,13 @@ function EventDetail({ ev, me, claims, settings, actions, onBack, goClaims }) {
   );
 }
 
-function MyClaims({ mine, actions, me, settings }) {
+function MyClaims({ mine, claims, actions, me, settings }) {
   if (mine.length === 0) return <Empty>You haven't claimed anything yet. Open a live event to place your first claim.</Empty>;
   return (
     <div style={{ display: "grid", gap: 12 }}>
       {mine.map((c) => {
         const overdue = c.status === "awaiting_deposit" && c.deadline && new Date(c.deadline) < Date.now();
+        const wp = c.status === "waitlisted" ? waitlistPosition(c, claims) : null;
         return (
           <Card key={c.id}>
             <div style={{ display: "flex", gap: 12, alignItems: "flex-start", flexWrap: "wrap" }}>
@@ -809,6 +990,16 @@ function MyClaims({ mine, actions, me, settings }) {
               <div style={{ flex: 1, minWidth: 200 }}>
                 <div style={{ fontWeight: 700 }}>{c.product} <span style={{ color: C.sub, fontWeight: 400 }}>×{c.qty}</span></div>
                 <div style={{ fontSize: 13, color: C.sub }}>{c.eventTitle} · claimed {fmtDT(c.claimedAt)}</div>
+                {wp && wp.pos > 0 && (
+                  <div style={{ marginTop: 8, fontSize: 14, background: "#EEE9F7", color: "#5B4A8A", padding: "8px 10px", borderRadius: 8, fontWeight: 600 }}>
+                    Waitlist position #{wp.pos} of {wp.total} — you'll be moved up automatically if stock frees up.
+                  </div>
+                )}
+                {c.promoted && c.status === "awaiting_deposit" && (
+                  <div style={{ marginTop: 8, fontSize: 13, color: C.teal, fontWeight: 700 }}>
+                    You've been moved off the waitlist — pay your deposit to secure it.
+                  </div>
+                )}
                 {c.status === "awaiting_deposit" && (
                   <div style={{ marginTop: 8, fontSize: 14, background: C.amberSoft, padding: "8px 10px", borderRadius: 8 }}>
                     Pay <b>{money(c.depositTotal)}</b> with reference <span style={{ fontFamily: C.mono, fontWeight: 700 }}>{c.ref}</span> by <b>{fmtDT(c.deadline)}</b>
@@ -821,8 +1012,10 @@ function MyClaims({ mine, actions, me, settings }) {
               <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end" }}>
                 <Chip s={overdue ? "expired" : c.status} />
                 <PayChip p={overdue && c.paymentStatus === "awaiting" ? "overdue" : c.paymentStatus} />
-                {c.status === "awaiting_deposit" && (
-                  <Btn small kind="danger" onClick={() => actions.updateClaim(c, { status: "cancelled", paymentStatus: "cancelled" }, me.name, "Claim cancelled by customer")}>Cancel claim</Btn>
+                {(c.status === "awaiting_deposit" || c.status === "waitlisted") && (
+                  <Btn small kind="danger" onClick={() => actions.updateClaim(c, { status: "cancelled", paymentStatus: "cancelled", cancelledBy: "customer" }, me.name, c.status === "waitlisted" ? "Left waitlist" : "Claim cancelled by customer")}>
+                    {c.status === "waitlisted" ? "Leave waitlist" : "Cancel claim"}
+                  </Btn>
                 )}
               </div>
             </div>
@@ -933,7 +1126,7 @@ function ClaimsTab({ claims, events, actions, me }) {
       ) : (
         <div style={{ display: "grid", gap: 10 }}>
           {filtered.map((c) => (
-            <AdminClaimRow key={c.id} c={c} ev={events.find((e) => e.id === c.eventId)} actions={actions} me={me} />
+            <AdminClaimRow key={c.id} c={c} ev={events.find((e) => e.id === c.eventId)} claims={claims} actions={actions} me={me} />
           ))}
         </div>
       )}
@@ -941,8 +1134,9 @@ function ClaimsTab({ claims, events, actions, me }) {
   );
 }
 
-function AdminClaimRow({ c, ev, actions, me }) {
+function AdminClaimRow({ c, ev, claims, actions, me }) {
   const overdue = c.status === "awaiting_deposit" && c.deadline && new Date(c.deadline) < Date.now();
+  const wp = c.status === "waitlisted" ? waitlistPosition(c, claims) : null;
   const A = (patch, label) => () => actions.updateClaim(c, patch, me.name, label);
   return (
     <Card style={{ padding: 12 }}>
@@ -951,10 +1145,14 @@ function AdminClaimRow({ c, ev, actions, me }) {
         <div style={{ flex: 1, minWidth: 220 }}>
           <div style={{ fontWeight: 700, fontSize: 14 }}>
             {c.customer} <span style={{ color: C.sub, fontWeight: 400 }}>· {c.product} ×{c.qty}</span>
+            {wp && wp.pos > 0 && <span style={{ color: "#5B4A8A", fontWeight: 700 }}> · queue #{wp.pos} of {wp.total}</span>}
           </div>
           <div style={{ fontSize: 12, color: C.sub }}>
             {c.eventTitle} · {fmtDT(c.claimedAt)} · ref <span style={{ fontFamily: C.mono, fontWeight: 700 }}>{c.ref}</span> · deposit {money(c.depositTotal)}
             {c.deadline && c.paymentStatus === "awaiting" && <span style={{ color: overdue ? C.red : C.amber, fontWeight: 700 }}> · {timeLeft(c.deadline)}</span>}
+            {c.promoted && <span style={{ color: C.teal }}> · promoted {fmtDT(c.promotedAt)}</span>}
+            {c.paidLate && <span style={{ color: C.amber }}> · paid late</span>}
+            {c.noShow && <span style={{ color: C.red, fontWeight: 700 }}> · no-show</span>}
           </div>
         </div>
         <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
@@ -962,14 +1160,28 @@ function AdminClaimRow({ c, ev, actions, me }) {
         </div>
       </div>
       <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap" }}>
-        {c.status === "awaiting_deposit" && <Btn small kind="teal" onClick={A({ status: "deposit_received", paymentStatus: "received" }, "Deposit marked received")}>Mark deposit received</Btn>}
+        {c.status === "awaiting_deposit" && (
+          <Btn small kind="teal" onClick={A(
+            { status: "deposit_received", paymentStatus: "received", ...(overdue ? { paidLate: true } : {}) },
+            overdue ? "Deposit received (late)" : "Deposit marked received"
+          )}>Mark deposit received</Btn>
+        )}
         {c.status === "deposit_received" && <Btn small kind="teal" onClick={A({ status: "confirmed" }, "Claim confirmed")}>Confirm claim</Btn>}
         {c.status === "confirmed" && <Btn small kind="teal" onClick={A({ status: "ready" }, "Marked ready for collection")}>Ready for collection</Btn>}
         {c.status === "ready" && <Btn small kind="teal" onClick={A({ status: "collected" }, "Marked collected")}>Mark collected</Btn>}
-        {c.status === "waitlisted" && ev && <Btn small onClick={() => actions.promoteFromWaitlist(c, ev, me.name)}>Move off waitlist</Btn>}
+        {c.status === "ready" && (
+          <Btn small kind="ghost" onClick={A({ status: "cancelled", noShow: true, cancelledBy: "admin", paymentStatus: "forfeited" }, "Marked as no-show (deposit forfeited)")}>No-show</Btn>
+        )}
+        {c.status === "waitlisted" && ev && (
+          <>
+            <Btn small onClick={() => actions.promoteFromWaitlist(c, ev, me.name)}>Move off waitlist</Btn>
+            <Btn small kind="ghost" disabled={!wp || wp.pos <= 1} onClick={() => actions.moveWaitlist(c, -1, me.name)}>↑ Up</Btn>
+            <Btn small kind="ghost" disabled={!wp || wp.pos >= wp.total} onClick={() => actions.moveWaitlist(c, 1, me.name)}>↓ Down</Btn>
+          </>
+        )}
         {overdue && <Btn small kind="ghost" onClick={A({ status: "expired", paymentStatus: "overdue" }, "Claim expired (deposit not received)")}>Expire claim</Btn>}
         {!["cancelled", "expired", "collected"].includes(c.status) && (
-          <Btn small kind="danger" onClick={A({ status: "cancelled", paymentStatus: c.paymentStatus === "received" ? "refunded" : "cancelled" }, "Claim cancelled by admin")}>Cancel</Btn>
+          <Btn small kind="danger" onClick={A({ status: "cancelled", cancelledBy: "admin", paymentStatus: c.paymentStatus === "received" ? "refunded" : "cancelled" }, "Claim cancelled by admin")}>Cancel</Btn>
         )}
       </div>
     </Card>
@@ -1017,18 +1229,24 @@ function EventsTab({ events, claims, actions, me, settings }) {
 function EventForm({ initial, onDone, actions, me, settings }) {
   const toLocal = (iso) => (iso ? new Date(new Date(iso).getTime() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16) : "");
   const [ev, setEv] = useState(
-    initial || {
-      id: "ev-" + uid(), title: "", description: "", image: null,
-      products: [{ code: "A1", name: "", price: 0, deposit: settings?.defaultDeposit ?? 10, qty: 1 }],
-      opensAt: nowISO(), closesAt: new Date(Date.now() + 48 * 3600e3).toISOString(),
-      paymentHours: settings?.defaultPaymentHours ?? 24, waitlist: true, published: false, createdAt: nowISO(),
-    }
+    initial
+      ? { autoExpire: false, autoPromote: false, ...initial, rules: { ...defaultRules(), ...(initial.rules || {}), earlyAccess: { ...defaultRules().earlyAccess, ...((initial.rules || {}).earlyAccess || {}) } } }
+      : {
+          id: "ev-" + uid(), title: "", description: "", image: null,
+          products: [{ code: "A1", name: "", price: 0, deposit: settings?.defaultDeposit ?? 10, qty: 1, maxPerCustomer: 0, excludeIfClaimed: "" }],
+          opensAt: nowISO(), closesAt: new Date(Date.now() + 48 * 3600e3).toISOString(),
+          paymentHours: settings?.defaultPaymentHours ?? 24, waitlist: true,
+          autoExpire: true, autoPromote: true, rules: defaultRules(),
+          published: false, createdAt: nowISO(),
+        }
   );
   const [msg, setMsg] = useState(null);
   const fileRef = useRef(null);
 
   const setP = (i, k, v) => setEv({ ...ev, products: ev.products.map((p, j) => (j === i ? { ...p, [k]: v } : p)) });
-  const addP = () => setEv({ ...ev, products: [...ev.products, { code: "", name: "", price: 0, deposit: settings?.defaultDeposit ?? 10, qty: 1 }] });
+  const addP = () => setEv({ ...ev, products: [...ev.products, { code: "", name: "", price: 0, deposit: settings?.defaultDeposit ?? 10, qty: 1, maxPerCustomer: 0, excludeIfClaimed: "" }] });
+  const setR = (k, v) => setEv({ ...ev, rules: { ...ev.rules, [k]: v } });
+  const setEA = (k, v) => setEv({ ...ev, rules: { ...ev.rules, earlyAccess: { ...ev.rules.earlyAccess, [k]: v } } });
   const rmP = (i) => setEv({ ...ev, products: ev.products.filter((_, j) => j !== i) });
 
   const onFile = (file) => {
@@ -1058,7 +1276,18 @@ function EventForm({ initial, onDone, actions, me, settings }) {
     if (codes.some((c) => !c)) return setMsg("Every product needs a claim code.");
     if (new Set(codes).size !== codes.length) return setMsg("Claim codes must be unique within the event.");
     if (ev.products.some((p) => !p.name)) return setMsg("Every product needs a name.");
-    const clean = { ...ev, products: ev.products.map((p) => ({ ...p, code: p.code.trim().toUpperCase(), price: +p.price || 0, deposit: +p.deposit || 0, qty: Math.max(1, +p.qty || 1) })) };
+    const clean = {
+      ...ev,
+      products: ev.products.map((p) => ({
+        ...p,
+        code: p.code.trim().toUpperCase(),
+        price: +p.price || 0,
+        deposit: +p.deposit || 0,
+        qty: Math.max(1, +p.qty || 1),
+        maxPerCustomer: Math.max(0, +p.maxPerCustomer || 0),
+        excludeIfClaimed: (p.excludeIfClaimed || "").trim().toUpperCase(),
+      })),
+    };
     await actions.saveEvent(clean, me.name, !initial);
     onDone();
   };
@@ -1084,35 +1313,83 @@ function EventForm({ initial, onDone, actions, me, settings }) {
 
       <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: C.sub, margin: "16px 0 8px" }}>Products</div>
       <div style={{ overflowX: "auto" }}>
-        <div style={{ display: "flex", gap: 8, marginBottom: 4, minWidth: 560, fontSize: 11, fontWeight: 700, letterSpacing: "0.04em", textTransform: "uppercase", color: C.sub }}>
+        <div style={{ display: "flex", gap: 8, marginBottom: 4, minWidth: 700, fontSize: 11, fontWeight: 700, letterSpacing: "0.04em", textTransform: "uppercase", color: C.sub }}>
           <div style={{ width: 70 }}>Code</div>
           <div style={{ flex: 1 }}>Product name</div>
-          <div style={{ width: 90 }}>Full price</div>
-          <div style={{ width: 90 }}>Deposit / item</div>
-          <div style={{ width: 70 }}>Qty avail.</div>
+          <div style={{ width: 80 }}>Full price</div>
+          <div style={{ width: 80 }}>Deposit / item</div>
+          <div style={{ width: 60 }}>Qty avail.</div>
+          <div style={{ width: 70 }}>Limit / cust.</div>
+          <div style={{ width: 70 }}>Excl. code</div>
           <div style={{ width: 34 }} />
         </div>
         {ev.products.map((p, i) => (
-          <div key={i} style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center", minWidth: 560 }}>
+          <div key={i} style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center", minWidth: 700 }}>
             <input style={{ ...inputStyle, width: 70 }} value={p.code} placeholder="A1" onChange={(e) => setP(i, "code", e.target.value)} />
             <input style={{ ...inputStyle, flex: 1 }} value={p.name} placeholder="Product name" onChange={(e) => setP(i, "name", e.target.value)} />
-            <input style={{ ...inputStyle, width: 90 }} type="number" value={p.price} placeholder="Price" onChange={(e) => setP(i, "price", e.target.value)} />
-            <input style={{ ...inputStyle, width: 90 }} type="number" value={p.deposit} placeholder="Deposit" onChange={(e) => setP(i, "deposit", e.target.value)} />
-            <input style={{ ...inputStyle, width: 70 }} type="number" value={p.qty} placeholder="Qty" onChange={(e) => setP(i, "qty", e.target.value)} />
+            <input style={{ ...inputStyle, width: 80 }} type="number" value={p.price} placeholder="Price" onChange={(e) => setP(i, "price", e.target.value)} />
+            <input style={{ ...inputStyle, width: 80 }} type="number" value={p.deposit} placeholder="Deposit" onChange={(e) => setP(i, "deposit", e.target.value)} />
+            <input style={{ ...inputStyle, width: 60 }} type="number" value={p.qty} placeholder="Qty" onChange={(e) => setP(i, "qty", e.target.value)} />
+            <input style={{ ...inputStyle, width: 70 }} type="number" value={p.maxPerCustomer || 0} title="Max per customer (0 = no limit)" onChange={(e) => setP(i, "maxPerCustomer", e.target.value)} />
+            <input style={{ ...inputStyle, width: 70 }} value={p.excludeIfClaimed || ""} placeholder="—" title="Block if customer already claimed this code" onChange={(e) => setP(i, "excludeIfClaimed", e.target.value)} />
             <Btn kind="danger" small onClick={() => rmP(i)} disabled={ev.products.length === 1}>×</Btn>
           </div>
         ))}
       </div>
+      <div style={{ fontSize: 11, color: C.sub, marginBottom: 8 }}>
+        Limit / cust.: max each customer can claim of this product (0 = no limit). Excl. code: block customers who already claimed that code — e.g. put A1 on the premium box so booster-box claimers can't take both.
+      </div>
       <Btn kind="ghost" small onClick={addP}>+ Add product</Btn>
+
+      <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: C.sub, margin: "20px 0 8px" }}>Claim rules (optional)</div>
+      <div style={{ display: "grid", gap: 12, gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))" }}>
+        <Field label="Max items per customer" hint="Across the whole event. 0 = no limit.">
+          <input style={inputStyle} type="number" value={ev.rules.maxItemsPerCustomer} onChange={(e) => setR("maxItemsPerCustomer", Math.max(0, +e.target.value || 0))} />
+        </Field>
+        <Field label="Min reliability score" hint="0 = off. Scores run 0–100; new customers start at 100.">
+          <input style={inputStyle} type="number" value={ev.rules.minScore} onChange={(e) => setR("minScore", Math.max(0, Math.min(100, +e.target.value || 0)))} />
+        </Field>
+        <Field label="Min account age (days)" hint="0 = off. Blocks freshly made accounts.">
+          <input style={inputStyle} type="number" value={ev.rules.minAccountDays} onChange={(e) => setR("minAccountDays", Math.max(0, +e.target.value || 0))} />
+        </Field>
+      </div>
+      <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 14, cursor: "pointer", marginBottom: 8 }}>
+        <input type="checkbox" checked={ev.rules.earlyAccess.enabled} onChange={(e) => setEA("enabled", e.target.checked)} />
+        Early-access window before general claiming opens
+      </label>
+      {ev.rules.earlyAccess.enabled && (
+        <div style={{ display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap", padding: "10px 12px", background: C.bg, borderRadius: 10, marginBottom: 12 }}>
+          <label style={{ fontSize: 13 }}>
+            First <input style={{ ...inputStyle, width: 70, display: "inline-block", padding: "5px 8px", margin: "0 6px" }} type="number" value={ev.rules.earlyAccess.minutes} onChange={(e) => setEA("minutes", Math.max(1, +e.target.value || 30))} /> minutes reserved for:
+          </label>
+          {["vip", "staff"].map((g) => (
+            <label key={g} style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 13, cursor: "pointer" }}>
+              <input type="checkbox" checked={(ev.rules.earlyAccess.groups || []).includes(g)}
+                onChange={(e) => setEA("groups", e.target.checked ? [...(ev.rules.earlyAccess.groups || []), g] : (ev.rules.earlyAccess.groups || []).filter((x) => x !== g))} />
+              {CUSTOMER_GROUPS[g]}
+            </label>
+          ))}
+        </div>
+      )}
 
       <div style={{ display: "grid", gap: 12, gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", marginTop: 18 }}>
         <Field label="Claims open"><input style={inputStyle} type="datetime-local" value={toLocal(ev.opensAt)} onChange={(e) => setEv({ ...ev, opensAt: new Date(e.target.value).toISOString() })} /></Field>
         <Field label="Claims close"><input style={inputStyle} type="datetime-local" value={toLocal(ev.closesAt)} onChange={(e) => setEv({ ...ev, closesAt: new Date(e.target.value).toISOString() })} /></Field>
-        <Field label="Payment window (hours)"><input style={inputStyle} type="number" value={ev.paymentHours} onChange={(e) => setEv({ ...ev, paymentHours: Math.max(1, +e.target.value || 24) })} /></Field>
+        <Field label="Payment window (hours)" hint="Decimals allowed — 0.5 = 30 minutes.">
+          <input style={inputStyle} type="number" step="0.5" value={ev.paymentHours} onChange={(e) => setEv({ ...ev, paymentHours: Math.max(0.25, +e.target.value || 24) })} />
+        </Field>
       </div>
-      <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 14, cursor: "pointer", marginBottom: 14 }}>
+      <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 14, cursor: "pointer", marginBottom: 6 }}>
         <input type="checkbox" checked={ev.waitlist} onChange={(e) => setEv({ ...ev, waitlist: e.target.checked })} />
         Allow waitlist when a product sells out
+      </label>
+      <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 14, cursor: "pointer", marginBottom: 6 }}>
+        <input type="checkbox" checked={!!ev.autoExpire} onChange={(e) => setEv({ ...ev, autoExpire: e.target.checked })} />
+        Automatically expire unpaid reservations after the payment window (stock returns to available)
+      </label>
+      <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 14, cursor: "pointer", marginBottom: 14 }}>
+        <input type="checkbox" checked={!!ev.autoPromote} onChange={(e) => setEv({ ...ev, autoPromote: e.target.checked })} />
+        Automatically offer freed stock to the waitlist, first come first served
       </label>
 
       {msg && <div style={{ color: C.red, fontSize: 13, marginBottom: 10 }}>{msg}</div>}
@@ -1129,26 +1406,64 @@ function CustomersTab({ users, claims, actions, me }) {
   const customers = users.filter((u) => u.role === "customer");
   const pending = customers.filter((u) => u.status === "pending");
   const rest = customers.filter((u) => u.status !== "pending");
-  const Row = ({ u }) => (
-    <Card style={{ padding: 12 }}>
-      <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-        <div style={{ flex: 1, minWidth: 220 }}>
-          <div style={{ fontWeight: 700 }}>{u.name}</div>
-          <div style={{ fontSize: 13, color: C.sub }}>{u.email} · {u.mobile} · pays by {u.pay}{u.notes ? ` · "${u.notes}"` : ""}</div>
-          <div style={{ fontSize: 12, color: C.sub }}>Registered {fmtDT(u.createdAt)} · {claims.filter((c) => c.userId === u.id).length} claims</div>
+
+  const ScoreBadge = ({ u }) => {
+    const sc = scoreFor(u, claims);
+    const fg = sc >= 90 ? C.teal : sc >= 60 ? C.amber : C.red;
+    const bg = sc >= 90 ? C.tealSoft : sc >= 60 ? C.amberSoft : C.redSoft;
+    return <span title="Reliability score (admin-only)" style={{ background: bg, color: fg, fontWeight: 800, fontSize: 13, padding: "3px 10px", borderRadius: 99 }}>{sc}</span>;
+  };
+
+  const Row = ({ u }) => {
+    const st = scoreStats(u.id, claims);
+    const historyBits = [
+      st.collected && `${st.collected} collected`,
+      st.cancelled && `${st.cancelled} cancelled`,
+      st.expired && `${st.expired} unpaid/expired`,
+      st.noShows && `${st.noShows} no-show${st.noShows > 1 ? "s" : ""}`,
+      st.late && `${st.late} late payment${st.late > 1 ? "s" : ""}`,
+    ].filter(Boolean).join(" · ");
+    return (
+      <Card style={{ padding: 12 }}>
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <div style={{ flex: 1, minWidth: 220 }}>
+            <div style={{ fontWeight: 700, display: "flex", gap: 8, alignItems: "center" }}>{u.name} <ScoreBadge u={u} /></div>
+            <div style={{ fontSize: 13, color: C.sub }}>{u.email} · {u.mobile} · pays by {u.pay}{u.notes ? ` · "${u.notes}"` : ""}</div>
+            <div style={{ fontSize: 12, color: C.sub }}>
+              Registered {fmtDT(u.createdAt)} · {claims.filter((c) => c.userId === u.id).length} claims
+              {historyBits ? ` · ${historyBits}` : " · no history yet"}
+              {+u.scoreAdj ? ` · manual adjustment ${+u.scoreAdj > 0 ? "+" : ""}${u.scoreAdj}` : ""}
+            </div>
+          </div>
+          <select
+            title="Customer group — used by early-access claim rules"
+            style={{ ...inputStyle, width: "auto", padding: "6px 8px" }}
+            value={u.group || "standard"}
+            onChange={(e) => actions.setUserGroup(u, e.target.value, me.name)}
+          >
+            {Object.entries(CUSTOMER_GROUPS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+          </select>
+          <input
+            title="Manual score adjustment (+/−), added to the calculated reliability score"
+            style={{ ...inputStyle, width: 64, padding: "6px 8px" }}
+            type="number"
+            key={u.id + ":" + (u.scoreAdj || 0)}
+            defaultValue={u.scoreAdj || 0}
+            onBlur={(e) => { const v = +e.target.value || 0; if (v !== (+u.scoreAdj || 0)) actions.setUserScoreAdj(u, v, me.name); }}
+          />
+          <span style={{ fontSize: 12, fontWeight: 700, color: { pending: C.amber, approved: C.teal, rejected: C.red, suspended: C.red }[u.status] }}>{u.status.toUpperCase()}</span>
+          <div style={{ display: "flex", gap: 6 }}>
+            {u.status === "pending" && <>
+              <Btn small kind="teal" onClick={() => actions.setUserStatus(u, "approved", me.name)}>Approve</Btn>
+              <Btn small kind="danger" onClick={() => actions.setUserStatus(u, "rejected", me.name)}>Reject</Btn>
+            </>}
+            {u.status === "approved" && <Btn small kind="danger" onClick={() => actions.setUserStatus(u, "suspended", me.name)}>Suspend</Btn>}
+            {(u.status === "suspended" || u.status === "rejected") && <Btn small kind="teal" onClick={() => actions.setUserStatus(u, "approved", me.name)}>Approve</Btn>}
+          </div>
         </div>
-        <span style={{ fontSize: 12, fontWeight: 700, color: { pending: C.amber, approved: C.teal, rejected: C.red, suspended: C.red }[u.status] }}>{u.status.toUpperCase()}</span>
-        <div style={{ display: "flex", gap: 6 }}>
-          {u.status === "pending" && <>
-            <Btn small kind="teal" onClick={() => actions.setUserStatus(u, "approved", me.name)}>Approve</Btn>
-            <Btn small kind="danger" onClick={() => actions.setUserStatus(u, "rejected", me.name)}>Reject</Btn>
-          </>}
-          {u.status === "approved" && <Btn small kind="danger" onClick={() => actions.setUserStatus(u, "suspended", me.name)}>Suspend</Btn>}
-          {(u.status === "suspended" || u.status === "rejected") && <Btn small kind="teal" onClick={() => actions.setUserStatus(u, "approved", me.name)}>Approve</Btn>}
-        </div>
-      </div>
-    </Card>
-  );
+      </Card>
+    );
+  };
   return (
     <div style={{ display: "grid", gap: 10 }}>
       {pending.length > 0 && (

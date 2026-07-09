@@ -174,6 +174,25 @@ const isOpen = (ev) => {
   const n = Date.now();
   return ev.published && new Date(ev.opensAt) <= n && n < new Date(ev.closesAt);
 };
+
+/* ---------- public event URLs (#/event/<id>) ---------- */
+const getRoute = () => {
+  const m = (typeof window !== "undefined" ? window.location.hash : "").match(/^#\/event\/([\w-]+)/);
+  return m ? { eventId: m[1] } : null;
+};
+const eventShareUrl = (ev) =>
+  `${window.location.origin}${window.location.pathname}#/event/${ev.id}`;
+
+// human countdown, e.g. "2d 4h", "3h 12m", "9m 40s"
+function countdown(iso) {
+  const ms = new Date(iso) - Date.now();
+  if (ms <= 0) return null;
+  const d = Math.floor(ms / 86400e3), h = Math.floor((ms % 86400e3) / 3600e3),
+    m = Math.floor((ms % 3600e3) / 60000), s = Math.floor((ms % 60000) / 1000);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m ${s}s`;
+}
 const heldQty = (claims, eventId, code) =>
   claims
     .filter((c) => c.eventId === eventId && c.code === code && HOLDS_STOCK.includes(c.status))
@@ -413,6 +432,13 @@ export default function App() {
   const [audit, setAudit] = useState([]);
   const [settings, setSettings] = useState(defaultSettings());
   const [session, setSession] = useState(null);
+  const [route, setRoute] = useState(getRoute());
+  const [wantAuth, setWantAuth] = useState(false);
+  useEffect(() => {
+    const onHash = () => { setRoute(getRoute()); setWantAuth(false); };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState(null);
   const toastTimer = useRef(null);
@@ -665,14 +691,106 @@ export default function App() {
         </div>
       )}
       {!me ? (
-        <AuthScreen actions={actions} />
+        route && !wantAuth ? (
+          <PublicEventPage
+            ev={events.find((e) => e.id === route.eventId)}
+            claims={claims}
+            settings={settings}
+            onAuth={() => setWantAuth(true)}
+          />
+        ) : (
+          <AuthScreen actions={actions} />
+        )
       ) : me.status !== "approved" ? (
         <PendingScreen me={me} actions={actions} />
       ) : isStaffRole(me.role) ? (
         <AdminApp me={me} users={users} events={events} claims={claims} audit={audit} settings={settings} actions={actions} />
       ) : (
-        <CustomerApp me={me} events={events} claims={claims} settings={settings} actions={actions} />
+        <CustomerApp me={me} events={events} claims={claims} settings={settings} actions={actions} initialEventId={route ? route.eventId : null} />
       )}
+    </div>
+  );
+}
+
+/* ============================================================
+   PUBLIC EVENT LANDING PAGE (shareable, no sign-in required)
+   ============================================================ */
+function PublicEventPage({ ev, claims, settings, onAuth }) {
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => tick((x) => x + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  const visible = ev && ev.published;
+  const opensIn = visible ? countdown(ev.opensAt) : null;
+  const closesIn = visible ? countdown(ev.closesAt) : null;
+  const live = visible && !opensIn && closesIn;
+
+  return (
+    <div>
+      <Header brand={settings.storeName} title={visible ? ev.title : "Claim event"} sub="Shared claim event" right={<Btn kind="ghost" small style={{ borderColor: "rgba(255,255,255,0.3)", color: "#F1EFE9" }} onClick={onAuth}>Sign in</Btn>} />
+      <div style={{ maxWidth: 720, margin: "0 auto", padding: 20 }}>
+        {!visible ? (
+          <Card style={{ textAlign: "center", padding: 32 }}>
+            <div style={{ fontWeight: 700, fontSize: 17, marginBottom: 6 }}>This event isn't available</div>
+            <div style={{ color: C.sub, fontSize: 14, marginBottom: 16 }}>The link may be wrong, or the store hasn't published this drop yet.</div>
+            <Btn onClick={onAuth}>Sign in</Btn>
+          </Card>
+        ) : (
+          <>
+            <Card style={{ padding: 0, overflow: "hidden", marginBottom: 14 }}>
+              {ev.image && <img src={ev.image} alt="Drop photo with claim codes" style={{ width: "100%", display: "block" }} />}
+              <div style={{ padding: 16 }}>
+                <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                  <div style={{ fontSize: 20, fontWeight: 800, flex: 1 }}>{ev.title}</div>
+                  {opensIn ? (
+                    <span style={{ background: C.amberSoft, color: C.amber, fontWeight: 800, fontSize: 13, padding: "5px 12px", borderRadius: 99, fontFamily: C.mono }}>Opens in {opensIn}</span>
+                  ) : closesIn ? (
+                    <span style={{ background: C.tealSoft, color: C.teal, fontWeight: 800, fontSize: 13, padding: "5px 12px", borderRadius: 99, fontFamily: C.mono }}>● LIVE · closes in {closesIn}</span>
+                  ) : (
+                    <span style={{ background: C.redSoft, color: C.red, fontWeight: 800, fontSize: 13, padding: "5px 12px", borderRadius: 99 }}>Claims closed</span>
+                  )}
+                </div>
+                <div style={{ color: C.sub, fontSize: 14, marginTop: 6 }}>{ev.description}</div>
+              </div>
+            </Card>
+
+            <Card style={{ borderColor: C.teal, background: C.tealSoft, marginBottom: 14 }}>
+              <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                <div style={{ flex: 1, minWidth: 220, fontSize: 14 }}>
+                  <b>Want to claim?</b> Sign in with your approved account — or register now, and once the store approves you, you can claim{live ? " while stock lasts" : " when it opens"}.
+                </div>
+                <Btn kind="teal" onClick={onAuth}>Sign in / Register</Btn>
+              </div>
+            </Card>
+
+            <Card style={{ padding: 0 }}>
+              <div style={{ padding: "12px 16px", borderBottom: `1px solid ${C.line}`, fontSize: 11, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: C.sub }}>
+                What's in this drop
+              </div>
+              {ev.products.map((p) => {
+                const left = Math.max(0, p.qty - heldQty(claims, ev.id, p.code));
+                return (
+                  <div key={p.code} style={{ padding: "12px 16px", borderBottom: `1px solid ${C.line}`, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                    <Tag code={p.code} />
+                    <div style={{ flex: 1, minWidth: 160 }}>
+                      <div style={{ fontWeight: 600 }}>{p.name}</div>
+                      <div style={{ fontSize: 13, color: C.sub }}>
+                        {money(p.price)} · deposit {money(p.deposit)} each
+                        {+p.maxPerCustomer > 0 && <> · limit {p.maxPerCustomer}/customer</>}
+                      </div>
+                    </div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: left > 0 ? C.teal : C.red }}>
+                      {left > 0 ? `${left} left` : ev.waitlist ? "Sold out · waitlist" : "Sold out"}
+                    </div>
+                  </div>
+                );
+              })}
+            </Card>
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -796,9 +914,11 @@ function PendingScreen({ me, actions }) {
 /* ============================================================
    CUSTOMER APP
    ============================================================ */
-function CustomerApp({ me, events, claims, settings, actions }) {
+function CustomerApp({ me, events, claims, settings, actions, initialEventId }) {
   const [tab, setTab] = useState("events");
-  const [openEvent, setOpenEvent] = useState(null);
+  const [openEvent, setOpenEvent] = useState(() =>
+    initialEventId && events.some((e) => e.id === initialEventId && e.published) ? initialEventId : null
+  );
   const mine = claims.filter((c) => c.userId === me.id);
   const live = events.filter(isOpen);
   const upcoming = events.filter((e) => e.published && new Date(e.opensAt) > Date.now());
@@ -1215,6 +1335,14 @@ function EventsTab({ events, claims, actions, me, settings }) {
                     {ev.products.length} products · {claimed}/{totalQty} items claimed · opens {fmtDT(ev.opensAt)} · closes {fmtDT(ev.closesAt)}{ev.waitlist ? " · waitlist on" : ""}
                   </div>
                 </div>
+                {ev.published && (
+                  <Btn small kind="ghost" onClick={() => {
+                    const url = eventShareUrl(ev);
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                      navigator.clipboard.writeText(url).then(() => actions.notify("Share link copied — paste it into WhatsApp, Discord, or anywhere"), () => window.prompt("Copy this share link:", url));
+                    } else window.prompt("Copy this share link:", url);
+                  }}>Copy share link</Btn>
+                )}
                 <Btn small kind="ghost" onClick={() => setEditing(ev)}>Edit</Btn>
                 <Btn small kind={ev.published ? "danger" : "teal"} onClick={() => actions.togglePublish(ev, me.name)}>{ev.published ? "Unpublish" : "Publish"}</Btn>
               </div>

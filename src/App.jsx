@@ -81,8 +81,8 @@ const defaultSettings = () => ({
 // The anon key is designed to be public — it is safe in this file.
 // ---------------------------------------------------------------
 const REMOTE = {
-  url: "",     // e.g. "https://abcd1234.supabase.co"
-  anonKey: "", // the long "anon public" key
+  url: "https://rvznbawvyugjqbtocaph.supabase.co",     // e.g. "https://abcd1234.supabase.co"
+  anonKey: "sb_publishable_7PwblJf2CtYAQpSP4wl1mw_PZ9sVIIn", // the long "anon public" key
 };
 
 // Show the demo sign-in hints on the login screen (set true for internal testing)

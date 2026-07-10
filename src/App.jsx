@@ -81,8 +81,8 @@ const defaultSettings = () => ({
 // The anon key is designed to be public — it is safe in this file.
 // ---------------------------------------------------------------
 const REMOTE = {
-  url: "https://rvznbawvyugjqbtocaph.supabase.co",     // e.g. "https://abcd1234.supabase.co"
-  anonKey: "sb_publishable_7PwblJf2CtYAQpSP4wl1mw_PZ9sVIIn", // the long "anon public" key
+  url: "",     // e.g. "https://abcd1234.supabase.co"
+  anonKey: "", // the long "anon public" key
 };
 
 // Show the demo sign-in hints on the login screen (set true for internal testing)
@@ -842,7 +842,7 @@ function Header({ title, sub, right, brand = "Claim Desk", logo = null }) {
     <div style={{ background: "var(--header, #22271F)", color: "var(--header-text, #F1EFE9)", padding: "18px 20px" }}>
       <div style={{ maxWidth: 1080, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-          {logo && <img src={logo} alt={brand} style={{ height: 44, maxWidth: 150, objectFit: "contain" }} />}
+          {logo && <img src={logo} alt={brand} style={{ height: 68, maxWidth: 230, objectFit: "contain" }} />}
           <div>
             <div style={{ fontSize: 11, letterSpacing: "0.18em", textTransform: "uppercase", opacity: 0.65 }}>{brand}</div>
             <div style={{ fontSize: 20, fontWeight: 700 }}>{title}</div>
@@ -881,7 +881,7 @@ function AuthScreen({ actions, settings }) {
       <div style={{ width: "100%", maxWidth: 440 }}>
         <div style={{ textAlign: "center", marginBottom: 22 }}>
           {settings?.logo ? (
-            <img src={settings.logo} alt={settings.storeName} style={{ height: 64, maxWidth: 220, objectFit: "contain", marginBottom: 10 }} />
+            <img src={settings.logo} alt={settings.storeName} style={{ height: 110, maxWidth: 340, objectFit: "contain", marginBottom: 10 }} />
           ) : (
             <div style={{ display: "inline-flex", gap: 6, marginBottom: 10 }}>
               <Tag code="A1" /> <Tag code="B4" dark={false} />
@@ -1690,13 +1690,13 @@ function SettingsTab({ settings, users, actions, me }) {
     rd.onload = () => {
       const img = new Image();
       img.onload = () => {
-        const scale = Math.min(1, 160 / img.height, 500 / img.width);
+        const scale = Math.min(1, 280 / img.height, 800 / img.width);
         const cv = document.createElement("canvas");
         cv.width = Math.round(img.width * scale);
         cv.height = Math.round(img.height * scale);
         cv.getContext("2d").drawImage(img, 0, 0, cv.width, cv.height);
         const data = cv.toDataURL("image/png"); // PNG keeps transparency
-        if (data.length > 600000) setMsg("That logo is too large — try a simpler or smaller image.");
+        if (data.length > 900000) setMsg("That logo is too large — try a simpler or smaller image.");
         else setS((cur) => ({ ...cur, logo: data }));
       };
       img.src = rd.result;
@@ -1715,7 +1715,7 @@ function SettingsTab({ settings, users, actions, me }) {
           <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
             {s.logo && (
               <span style={{ background: s.headerColor || "#22271F", padding: "8px 14px", borderRadius: 8, display: "inline-flex" }}>
-                <img src={s.logo} alt="" style={{ height: 44, maxWidth: 150, objectFit: "contain" }} />
+                <img src={s.logo} alt="" style={{ height: 68, maxWidth: 230, objectFit: "contain" }} />
               </span>
             )}
             <input ref={logoRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => onLogo(e.target.files[0])} />

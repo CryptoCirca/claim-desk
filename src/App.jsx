@@ -64,6 +64,7 @@ const defaultSettings = () => ({
   accentColor: "#136A57",
   headerColor: "#22271F",
   paymentInstructions: "Bank transfer — BSB 000-000, Account 1234 5678, Name: Your Store. Use your claim reference as the transfer description, or pay in store.",
+  waCountryCode: "",
   defaultDeposit: 10,
   defaultPaymentHours: 24,
   emailFromName: "Your Store",
@@ -210,6 +211,50 @@ const getRoute = () => {
 };
 const eventShareUrl = (ev) =>
   `${window.location.origin}${window.location.pathname}#/event/${ev.id}`;
+
+/* ---------- WhatsApp deep links + message templates ---------- */
+const firstName = (n) => String(n || "").trim().split(/\s+/)[0] || "there";
+const shortName = (n) => {
+  const p = String(n || "").trim().split(/\s+/);
+  return p[0] + (p[1] ? ` ${p[1][0]}.` : "");
+};
+function ago(iso) {
+  const s = Math.max(0, (Date.now() - new Date(iso)) / 1000);
+  if (s < 60) return "just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+function waPhoneIntl(mobile, cc) {
+  let d = String(mobile || "").replace(/\D/g, "");
+  const c = String(cc || "").replace(/\D/g, "");
+  if (!d) return null;
+  if (c) {
+    if (d.startsWith("00" + c)) d = d.slice(2);
+    else if (d.startsWith("0")) d = c + d.slice(1);
+    else if (!d.startsWith(c)) d = c + d;
+  }
+  return d;
+}
+function openWhatsApp(mobile, cc, text) {
+  const p = waPhoneIntl(mobile, cc);
+  const url = p ? `https://wa.me/${p}?text=${encodeURIComponent(text)}` : `https://wa.me/?text=${encodeURIComponent(text)}`;
+  window.open(url, "_blank", "noopener");
+}
+const waTemplates = {
+  reminder: (c, s) =>
+    `Hi ${firstName(c.customer)}! Friendly reminder from ${s.storeName}: your ${money(c.depositTotal)} deposit for ${c.product} (code ${c.code}) is due by ${fmtDT(c.deadline)}.\n\nPay with reference: ${c.ref}\n\n${s.paymentInstructions}`,
+  promoted: (c, s) =>
+    `Hi ${firstName(c.customer)}! Great news from ${s.storeName} — you're off the waitlist! ${c.product} (code ${c.code}) is yours if you pay the ${money(c.depositTotal)} deposit by ${fmtDT(c.deadline)}.\n\nPay with reference: ${c.ref}\n\n${s.paymentInstructions}`,
+  ready: (c, s) =>
+    `Hi ${firstName(c.customer)}! Your order from ${s.storeName} is ready for collection 🎉\n\n${c.product} ×${c.qty} — just bring your reference ${c.ref} when you come in.`,
+};
+
+/* ---------- QR codes (generated via public image API, admin-side only) ---------- */
+const qrImg = (data, size = 320) =>
+  `https://api.qrserver.com/v1/create-qr-code/?size=${size}x${size}&margin=2&data=${encodeURIComponent(data)}`;
 
 // human countdown, e.g. "2d 4h", "3h 12m", "9m 40s"
 function countdown(iso) {
@@ -448,6 +493,90 @@ function Card({ children, style }) {
 }
 function Empty({ children }) {
   return <div style={{ padding: "36px 16px", textAlign: "center", color: C.sub, fontSize: 14 }}>{children}</div>;
+}
+
+/* ---------- drop photo with tappable claim pins ---------- */
+function PhotoWithPins({ ev, claims, onPick, alt = "Drop photo with claim codes" }) {
+  if (!ev.image) return null;
+  const pins = (ev.hotspots || []).filter((h) => ev.products.some((p) => p.code === h.code));
+  return (
+    <div style={{ position: "relative" }}>
+      <img src={ev.image} alt={alt} style={{ width: "100%", display: "block" }} />
+      {pins.map((h) => {
+        const p = ev.products.find((x) => x.code === h.code);
+        const left = Math.max(0, p.qty - heldQty(claims, ev.id, h.code));
+        return (
+          <button
+            key={h.code}
+            onClick={() => onPick && onPick(h.code)}
+            title={`${p.name} — ${left > 0 ? `${left} left` : "sold out"}`}
+            style={{
+              position: "absolute", left: `${h.x}%`, top: `${h.y}%`, transform: "translate(-50%, -50%)",
+              background: left > 0 ? C.teal : C.red, color: "#fff", border: "2px solid #fff", borderRadius: 99,
+              fontFamily: C.mono, fontWeight: 800, fontSize: 12, padding: "4px 9px",
+              cursor: onPick ? "pointer" : "default", boxShadow: "0 2px 8px rgba(0,0,0,0.35)",
+            }}
+          >
+            {h.code}{left <= 0 ? " ✕" : ""}
+          </button>
+        );
+      })}
+      {pins.length > 0 && onPick && (
+        <div style={{ position: "absolute", bottom: 8, right: 8, background: "rgba(0,0,0,0.55)", color: "#fff", fontSize: 11, fontWeight: 600, padding: "3px 8px", borderRadius: 99 }}>
+          Tap a code on the photo to claim it
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------- live stock indicator with urgency ---------- */
+function StockLine({ p, left, waitlist }) {
+  const pct = p.qty > 0 ? Math.round((left / p.qty) * 100) : 0;
+  const low = left > 0 && left <= Math.max(1, Math.ceil(p.qty * 0.25));
+  return (
+    <div style={{ minWidth: 110, textAlign: "right" }}>
+      <div style={{ fontSize: 13, fontWeight: 800, color: left > 0 ? (low ? C.amber : C.teal) : C.red }}>
+        {left > 0 ? (low ? `Only ${left} left!` : `${left} of ${p.qty} left`) : "Sold out"}
+      </div>
+      <div style={{ height: 5, background: C.line, borderRadius: 99, overflow: "hidden", marginTop: 3 }}>
+        <div style={{ width: `${pct}%`, height: "100%", background: low ? C.amber : C.teal, transition: "width 0.6s" }} />
+      </div>
+      {left <= 0 && waitlist && <div style={{ fontSize: 11, color: C.sub, marginTop: 2 }}>waitlist open</div>}
+    </div>
+  );
+}
+
+/* ---------- one-tap copy chip ---------- */
+function CopyChip({ label, value }) {
+  const [ok, setOk] = useState(false);
+  const copy = () => {
+    const done = () => { setOk(true); setTimeout(() => setOk(false), 1600); };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(String(value)).then(done, () => window.prompt("Copy:", value));
+    else window.prompt("Copy:", value);
+  };
+  return (
+    <button onClick={copy} style={{ display: "inline-flex", gap: 7, alignItems: "center", background: "#fff", border: `1.5px solid ${C.line}`, borderRadius: 8, padding: "6px 10px", cursor: "pointer", fontSize: 13 }}>
+      <span style={{ color: C.sub, fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em" }}>{label}</span>
+      <span style={{ fontFamily: C.mono, fontWeight: 700 }}>{String(value)}</span>
+      <span style={{ color: ok ? C.teal : C.sub, fontSize: 11, fontWeight: 700 }}>{ok ? "✓ copied" : "copy"}</span>
+    </button>
+  );
+}
+
+/* ---------- customer payment instructions box ---------- */
+function PaymentBox({ c, settings }) {
+  return (
+    <div style={{ marginTop: 8, background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: 12 }}>
+      <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: C.sub, marginBottom: 8 }}>How to pay</div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+        <CopyChip label="Amount" value={money(c.depositTotal)} />
+        <CopyChip label="Reference" value={c.ref} />
+      </div>
+      <div style={{ fontSize: 13 }}>{settings.paymentInstructions}</div>
+      <div style={{ fontSize: 12, color: C.sub, marginTop: 6 }}>Put the reference in your transfer description — that's how the store matches your payment instantly.</div>
+    </div>
+  );
 }
 
 /* ============================================================
@@ -756,10 +885,17 @@ export default function App() {
    ============================================================ */
 function PublicEventPage({ ev, claims, settings, onAuth }) {
   const [, tick] = useState(0);
+  const [hi, setHi] = useState(null);
   useEffect(() => {
     const t = setInterval(() => tick((x) => x + 1), 1000);
     return () => clearInterval(t);
   }, []);
+  const flashRow = (code) => {
+    setHi(code);
+    const el = document.getElementById(`pub-prod-${code}`);
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+    setTimeout(() => setHi(null), 2200);
+  };
 
   const visible = ev && ev.published;
   const opensIn = visible ? countdown(ev.opensAt) : null;
@@ -779,7 +915,7 @@ function PublicEventPage({ ev, claims, settings, onAuth }) {
         ) : (
           <>
             <Card style={{ padding: 0, overflow: "hidden", marginBottom: 14 }}>
-              {ev.image && <img src={ev.image} alt="Drop photo with claim codes" style={{ width: "100%", display: "block" }} />}
+              <PhotoWithPins ev={ev} claims={claims} onPick={flashRow} />
               <div style={{ padding: 16 }}>
                 <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
                   <div style={{ fontSize: 20, fontWeight: 800, flex: 1 }}>{ev.title}</div>
@@ -794,6 +930,29 @@ function PublicEventPage({ ev, claims, settings, onAuth }) {
                 <div style={{ color: C.sub, fontSize: 14, marginTop: 6 }}>{ev.description}</div>
               </div>
             </Card>
+
+            {(() => {
+              const recent = claims
+                .filter((c) => c.eventId === ev.id && !["cancelled", "expired"].includes(c.status))
+                .sort((a, b) => new Date(b.claimedAt) - new Date(a.claimedAt))
+                .slice(0, 5);
+              if (!live || recent.length === 0) return null;
+              return (
+                <Card style={{ marginBottom: 14, padding: "12px 16px" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                    <span style={{ width: 8, height: 8, borderRadius: 99, background: C.teal, display: "inline-block", animation: "pcsPulse 1.4s ease-in-out infinite" }} />
+                    <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: C.sub }}>Live activity · stock updates automatically</span>
+                  </div>
+                  <style>{`@keyframes pcsPulse { 0%,100% { opacity: 1 } 50% { opacity: 0.25 } }`}</style>
+                  {recent.map((c) => (
+                    <div key={c.id} style={{ fontSize: 13, padding: "3px 0", color: C.ink }}>
+                      <b>{shortName(c.customer)}</b> {c.status === "waitlisted" ? "joined the waitlist for" : "claimed"} <span style={{ fontFamily: C.mono, fontWeight: 700 }}>{c.code}</span>
+                      <span style={{ color: C.sub }}> · {ago(c.claimedAt)}</span>
+                    </div>
+                  ))}
+                </Card>
+              );
+            })()}
 
             <Card style={{ borderColor: C.teal, background: C.tealSoft, marginBottom: 14 }}>
               <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
@@ -811,7 +970,7 @@ function PublicEventPage({ ev, claims, settings, onAuth }) {
               {ev.products.map((p) => {
                 const left = Math.max(0, p.qty - heldQty(claims, ev.id, p.code));
                 return (
-                  <div key={p.code} style={{ padding: "12px 16px", borderBottom: `1px solid ${C.line}`, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                  <div key={p.code} id={`pub-prod-${p.code}`} style={{ padding: "12px 16px", borderBottom: `1px solid ${C.line}`, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", background: hi === p.code ? C.tealSoft : "transparent", transition: "background 0.5s" }}>
                     <Tag code={p.code} />
                     <div style={{ flex: 1, minWidth: 160 }}>
                       <div style={{ fontWeight: 600 }}>{p.name}</div>
@@ -820,9 +979,7 @@ function PublicEventPage({ ev, claims, settings, onAuth }) {
                         {+p.maxPerCustomer > 0 && <> · limit {p.maxPerCustomer}/customer</>}
                       </div>
                     </div>
-                    <div style={{ fontSize: 13, fontWeight: 700, color: left > 0 ? C.teal : C.red }}>
-                      {left > 0 ? `${left} left` : ev.waitlist ? "Sold out · waitlist" : "Sold out"}
-                    </div>
+                    <StockLine p={p} left={left} waitlist={ev.waitlist} />
                   </div>
                 );
               })}
@@ -1038,12 +1195,22 @@ function EventDetail({ ev, me, claims, settings, actions, onBack, goClaims }) {
     else setErr(r.msg);
   };
 
+  const pickCode = (code) => {
+    const p = ev.products.find((x) => x.code === code);
+    if (!p) return;
+    const left = Math.max(0, p.qty - heldQty(claims, ev.id, code));
+    const elig = claimEligibility(me, ev, p, claims);
+    if (elig.ok && (left > 0 || ev.waitlist)) { setSel(code); setQty(1); setErr(null); setPlaced(null); }
+    const el = document.getElementById(`prod-${code}`);
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+
   return (
     <div>
       <a onClick={onBack} style={{ color: C.teal, fontWeight: 600, fontSize: 14, cursor: "pointer" }}>← All events</a>
       <div style={{ display: "grid", gap: 18, gridTemplateColumns: "1fr", marginTop: 12 }}>
         <Card style={{ padding: 0, overflow: "hidden" }}>
-          {ev.image && <img src={ev.image} alt="Drop photo with claim codes" style={{ width: "100%", display: "block" }} />}
+          <PhotoWithPins ev={ev} claims={claims} onPick={pickCode} />
           <div style={{ padding: 16 }}>
             <div style={{ fontSize: 20, fontWeight: 800 }}>{ev.title}</div>
             <div style={{ color: C.sub, fontSize: 14, marginTop: 4 }}>{ev.description}</div>
@@ -1060,10 +1227,8 @@ function EventDetail({ ev, me, claims, settings, actions, onBack, goClaims }) {
             </div>
             {placed.ok === true && (
               <div style={{ fontSize: 14 }}>
-                Transfer <b>{money(placed.claim.depositTotal)}</b> using reference{" "}
-                <span style={{ fontFamily: C.mono, fontWeight: 700, background: "#fff", padding: "2px 8px", borderRadius: 6 }}>{placed.claim.ref}</span>{" "}
-                before <b>{fmtDT(placed.claim.deadline)}</b>. The store will confirm your deposit once received.
-                <div style={{ fontSize: 13, color: C.sub, marginTop: 6 }}>{settings.paymentInstructions}</div>
+                Transfer <b>{money(placed.claim.depositTotal)}</b> before <b>{fmtDT(placed.claim.deadline)}</b> to lock in your claim.
+                <PaymentBox c={placed.claim} settings={settings} />
               </div>
             )}
             {placed.ok === "wait" && <div style={{ fontSize: 14 }}>If stock frees up, the store will move you off the waitlist and you'll see deposit instructions in <b>My claims</b>.</div>}
@@ -1099,7 +1264,7 @@ function EventDetail({ ev, me, claims, settings, actions, onBack, goClaims }) {
             const elig = claimEligibility(me, ev, p, claims);
             const isSel = sel === p.code;
             return (
-              <div key={p.code} style={{ padding: "12px 16px", borderBottom: `1px solid ${C.line}`, background: isSel ? C.bg : "transparent" }}>
+              <div key={p.code} id={`prod-${p.code}`} style={{ padding: "12px 16px", borderBottom: `1px solid ${C.line}`, background: isSel ? C.bg : "transparent" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
                   <Tag code={p.code} />
                   <div style={{ flex: 1, minWidth: 160 }}>
@@ -1109,10 +1274,9 @@ function EventDetail({ ev, me, claims, settings, actions, onBack, goClaims }) {
                       {+p.maxPerCustomer > 0 && <> · limit {p.maxPerCustomer}/customer</>}
                     </div>
                     {!elig.ok && <div style={{ fontSize: 12, color: C.amber, fontWeight: 600, marginTop: 2 }}>{elig.msg}</div>}
+                    {left <= 0 && ev.waitlist && wl > 0 && <div style={{ fontSize: 12, color: "#5B4A8A", fontWeight: 600, marginTop: 2 }}>{wl} waiting</div>}
                   </div>
-                  <div style={{ fontSize: 13, fontWeight: 700, color: left > 0 ? C.teal : C.red }}>
-                    {left > 0 ? `${left} left` : ev.waitlist ? `Sold out · ${wl} waiting` : "Sold out"}
-                  </div>
+                  <StockLine p={p} left={left} waitlist={ev.waitlist} />
                   <Btn small kind={left > 0 ? "primary" : "ghost"} disabled={!elig.ok || (left <= 0 && !ev.waitlist)}
                     onClick={() => { setSel(isSel ? null : p.code); setQty(1); setErr(null); setPlaced(null); }}>
                     {isSel ? "Close" : left > 0 ? "Claim" : "Join waitlist"}
@@ -1169,10 +1333,12 @@ function MyClaims({ mine, claims, actions, me, settings }) {
                   </div>
                 )}
                 {c.status === "awaiting_deposit" && (
-                  <div style={{ marginTop: 8, fontSize: 14, background: C.amberSoft, padding: "8px 10px", borderRadius: 8 }}>
-                    Pay <b>{money(c.depositTotal)}</b> with reference <span style={{ fontFamily: C.mono, fontWeight: 700 }}>{c.ref}</span> by <b>{fmtDT(c.deadline)}</b>
-                    <span style={{ color: overdue ? C.red : C.amber, fontWeight: 700 }}> · {timeLeft(c.deadline)}</span>
-                    <div style={{ fontSize: 12, color: C.sub, marginTop: 4 }}>{settings.paymentInstructions}</div>
+                  <div style={{ marginTop: 8 }}>
+                    <div style={{ fontSize: 14, background: C.amberSoft, padding: "8px 10px", borderRadius: 8 }}>
+                      Deposit of <b>{money(c.depositTotal)}</b> due by <b>{fmtDT(c.deadline)}</b>
+                      <span style={{ color: overdue ? C.red : C.amber, fontWeight: 700 }}> · {timeLeft(c.deadline)}</span>
+                    </div>
+                    <PaymentBox c={c} settings={settings} />
                   </div>
                 )}
                 {c.status === "ready" && <div style={{ marginTop: 8, fontSize: 14, color: C.teal, fontWeight: 600 }}>Ready — collect from the store and bring your reference {c.ref}.</div>}
@@ -1198,10 +1364,11 @@ function MyClaims({ mine, claims, actions, me, settings }) {
    ADMIN APP
    ============================================================ */
 function AdminApp({ me, users, events, claims, audit, settings, actions }) {
-  const [tab, setTab] = useState("claims");
+  const [tab, setTab] = useState("today");
   const isSuper = me.role === "superadmin";
   const pendingCount = users.filter((u) => u.status === "pending").length;
   const tabs = [
+    ["today", "Today"],
     ["claims", `Claims (${claims.length})`],
     ["reports", "Reports"],
     ["events", `Events (${events.length})`],
@@ -1228,8 +1395,9 @@ function AdminApp({ me, users, events, claims, audit, settings, actions }) {
             <button key={k} onClick={() => setTab(k)} style={{ padding: "8px 16px", borderRadius: 99, border: "none", cursor: "pointer", fontWeight: 600, fontSize: 14, background: tab === k ? C.ink : "transparent", color: tab === k ? "#F1EFE9" : C.sub }}>{l}</button>
           ))}
         </div>
-        {tab === "claims" && <ClaimsTab claims={claims} events={events} actions={actions} me={me} />}
-        {tab === "reports" && <ReportsTab claims={claims} events={events} actions={actions} me={me} />}
+        {tab === "today" && <TodayTab users={users} events={events} claims={claims} settings={settings} actions={actions} me={me} go={setTab} />}
+        {tab === "claims" && <ClaimsTab claims={claims} events={events} actions={actions} me={me} settings={settings} />}
+        {tab === "reports" && <ReportsTab claims={claims} events={events} actions={actions} me={me} settings={settings} />}
         {tab === "events" && <EventsTab events={events} claims={claims} actions={actions} me={me} settings={settings} />}
         {tab === "customers" && <CustomersTab users={users} claims={claims} actions={actions} me={me} />}
         {tab === "audit" && <AuditTab audit={audit} />}
@@ -1239,8 +1407,101 @@ function AdminApp({ me, users, events, claims, audit, settings, actions }) {
   );
 }
 
+/* ---------- Today tab (staff daily dashboard) ---------- */
+function TodayTab({ users, events, claims, settings, actions, me, go }) {
+  const pending = users.filter((u) => u.status === "pending");
+  const outstanding = claims.filter((c) => c.paymentStatus === "awaiting" && HOLDS_STOCK.includes(c.status));
+  const overdue = outstanding.filter((c) => c.deadline && new Date(c.deadline) < Date.now());
+  const dueSoon = outstanding.filter((c) => c.deadline && new Date(c.deadline) >= Date.now() && new Date(c.deadline) - Date.now() <= 24 * 3600e3);
+  const ready = claims.filter((c) => c.status === "ready");
+  const liveEvents = events.filter(isOpen);
+  const hour = new Date().getHours();
+  const greet = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
+
+  const markReceived = (c) => {
+    const late = c.deadline && new Date(c.deadline) < Date.now();
+    actions.updateClaim(c, { status: "deposit_received", paymentStatus: "received", payReceivedAt: nowISO(), payReceivedBy: me.name, ...(late ? { paidLate: true } : {}) }, me.name, late ? "Deposit received (late)" : "Deposit marked received");
+  };
+
+  const ActionCard = ({ n, label, sub, color, tab }) => (
+    <div onClick={() => go(tab)} style={{ flex: 1, minWidth: 150, cursor: "pointer" }}>
+      <Card style={{ padding: "14px 16px", borderColor: n > 0 ? color : C.line }}>
+        <div style={{ fontSize: 26, fontWeight: 800, color: n > 0 ? color : C.sub }}>{n}</div>
+        <div style={{ fontSize: 13, fontWeight: 700 }}>{label}</div>
+        <div style={{ fontSize: 12, color: C.sub }}>{sub}</div>
+      </Card>
+    </div>
+  );
+
+  const allClear = pending.length === 0 && overdue.length === 0;
+
+  return (
+    <div>
+      <div style={{ marginBottom: 4, fontSize: 20, fontWeight: 800 }}>{greet}, {firstName(me.name)}</div>
+      <div style={{ fontSize: 13, color: C.sub, marginBottom: 14 }}>
+        {new Date().toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" })}
+        {liveEvents.length > 0 && (
+          <span style={{ color: C.teal, fontWeight: 700 }}>
+            {" · ● LIVE: "}{liveEvents.map((e) => e.title).join(", ")}
+          </span>
+        )}
+      </div>
+
+      <div style={{ display: "flex", gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
+        <ActionCard n={pending.length} label="Registrations to review" sub="approve or reject" color={C.amber} tab="customers" />
+        <ActionCard n={overdue.length} label="Overdue deposits" sub="chase or expire" color={C.red} tab="reports" />
+        <ActionCard n={dueSoon.length} label="Deposits due in 24h" sub="watch for payments" color={C.slate} tab="reports" />
+        <ActionCard n={ready.length} label="Ready for collection" sub="waiting at the counter" color={C.teal} tab="claims" />
+      </div>
+
+      {allClear ? (
+        <Card style={{ textAlign: "center", padding: 28 }}>
+          <div style={{ fontSize: 17, fontWeight: 800, color: C.teal }}>All clear 🎉</div>
+          <div style={{ fontSize: 13, color: C.sub, marginTop: 4 }}>No approvals waiting and nothing overdue. Nice work.</div>
+        </Card>
+      ) : (
+        <>
+          {pending.length > 0 && (
+            <Card style={{ marginBottom: 14, padding: 0 }}>
+              <div style={{ display: "flex", alignItems: "center", padding: "12px 16px", borderBottom: `1px solid ${C.line}` }}>
+                <div style={{ fontWeight: 800, flex: 1 }}>Waiting for approval ({pending.length})</div>
+                <Btn kind="ghost" small onClick={() => go("customers")}>View all</Btn>
+              </div>
+              {pending.slice(0, 5).map((u) => (
+                <div key={u.id} style={{ display: "flex", gap: 10, alignItems: "center", padding: "10px 16px", borderBottom: `1px solid ${C.line}`, fontSize: 13, flexWrap: "wrap" }}>
+                  <span style={{ flex: 1, minWidth: 160 }}><b>{u.name}</b> <span style={{ color: C.sub }}>· {u.email} · registered {ago(u.createdAt)}</span></span>
+                  <Btn small kind="teal" onClick={() => actions.setUserStatus(u, "approved", me.name)}>Approve</Btn>
+                  <Btn small kind="danger" onClick={() => actions.setUserStatus(u, "rejected", me.name)}>Reject</Btn>
+                </div>
+              ))}
+            </Card>
+          )}
+          {overdue.length > 0 && (
+            <Card style={{ marginBottom: 14, padding: 0 }}>
+              <div style={{ display: "flex", alignItems: "center", padding: "12px 16px", borderBottom: `1px solid ${C.line}` }}>
+                <div style={{ fontWeight: 800, flex: 1 }}>Overdue deposits ({overdue.length})</div>
+                <Btn kind="ghost" small onClick={() => go("reports")}>Reconcile</Btn>
+              </div>
+              {overdue.slice(0, 6).map((c) => (
+                <div key={c.id} style={{ display: "flex", gap: 10, alignItems: "center", padding: "10px 16px", borderBottom: `1px solid ${C.line}`, fontSize: 13, flexWrap: "wrap" }}>
+                  <span style={{ fontFamily: C.mono, fontWeight: 700 }}>{c.ref}</span>
+                  <span style={{ flex: 1, minWidth: 140 }}><b>{c.customer}</b> <span style={{ color: C.sub }}>· {c.code} {c.product} ×{c.qty}</span></span>
+                  <b>{money(c.depositTotal)}</b>
+                  <span style={{ color: C.red, fontWeight: 700, fontSize: 12 }}>overdue</span>
+                  <Btn small kind="ghost" onClick={() => openWhatsApp(c.mobile, settings.waCountryCode, (c.promoted ? waTemplates.promoted : waTemplates.reminder)(c, settings))}>💬 Remind</Btn>
+                  <Btn small kind="teal" onClick={() => markReceived(c)}>Mark received</Btn>
+                </div>
+              ))}
+            </Card>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 /* ---------- Claims tab ---------- */
-function ClaimsTab({ claims, events, actions, me }) {
+function ClaimsTab({ claims, events, actions, me, settings }) {
   const [f, setF] = useState({ event: "all", status: "all", pay: "all", q: "" });
   const filtered = claims.filter((c) => {
     if (f.event !== "all" && c.eventId !== f.event) return false;
@@ -1291,7 +1552,7 @@ function ClaimsTab({ claims, events, actions, me }) {
       ) : (
         <div style={{ display: "grid", gap: 10 }}>
           {filtered.map((c) => (
-            <AdminClaimRow key={c.id} c={c} ev={events.find((e) => e.id === c.eventId)} claims={claims} actions={actions} me={me} />
+            <AdminClaimRow key={c.id} c={c} ev={events.find((e) => e.id === c.eventId)} claims={claims} actions={actions} me={me} settings={settings} />
           ))}
         </div>
       )}
@@ -1299,10 +1560,11 @@ function ClaimsTab({ claims, events, actions, me }) {
   );
 }
 
-function AdminClaimRow({ c, ev, claims, actions, me }) {
+function AdminClaimRow({ c, ev, claims, actions, me, settings }) {
   const overdue = c.status === "awaiting_deposit" && c.deadline && new Date(c.deadline) < Date.now();
   const wp = c.status === "waitlisted" ? waitlistPosition(c, claims) : null;
   const A = (patch, label) => () => actions.updateClaim(c, patch, me.name, label);
+  const wa = (tpl) => () => openWhatsApp(c.mobile, settings?.waCountryCode, tpl(c, settings));
   return (
     <Card style={{ padding: 12 }}>
       <div style={{ display: "flex", gap: 12, alignItems: "flex-start", flexWrap: "wrap" }}>
@@ -1331,9 +1593,13 @@ function AdminClaimRow({ c, ev, claims, actions, me }) {
             overdue ? "Deposit received (late)" : "Deposit marked received"
           )}>Mark deposit received</Btn>
         )}
+        {c.status === "awaiting_deposit" && (
+          <Btn small kind="ghost" onClick={wa(c.promoted ? waTemplates.promoted : waTemplates.reminder)}>💬 Payment reminder</Btn>
+        )}
         {c.status === "deposit_received" && <Btn small kind="teal" onClick={A({ status: "confirmed" }, "Claim confirmed")}>Confirm claim</Btn>}
         {c.status === "confirmed" && <Btn small kind="teal" onClick={A({ status: "ready" }, "Marked ready for collection")}>Ready for collection</Btn>}
         {c.status === "ready" && <Btn small kind="teal" onClick={A({ status: "collected" }, "Marked collected")}>Mark collected</Btn>}
+        {c.status === "ready" && <Btn small kind="ghost" onClick={wa(waTemplates.ready)}>💬 Ready to collect</Btn>}
         {c.status === "ready" && (
           <Btn small kind="ghost" onClick={A({ status: "cancelled", noShow: true, cancelledBy: "admin", paymentStatus: "forfeited" }, "Marked as no-show (deposit forfeited)")}>No-show</Btn>
         )}
@@ -1375,7 +1641,7 @@ function StatCard({ label, value, sub, color }) {
   );
 }
 
-function ReportsTab({ claims, events, actions, me }) {
+function ReportsTab({ claims, events, actions, me, settings }) {
   const [eventF, setEventF] = useState("all");
   const [range, setRange] = useState("7");
   const [paste, setPaste] = useState("");
@@ -1565,7 +1831,12 @@ function ReportsTab({ claims, events, actions, me }) {
           <div style={{ padding: 16, fontSize: 13, color: C.sub }}>Nothing outstanding — all deposits are in. 🎉</div>
         ) : (
           [...outstanding].sort((a, b) => new Date(a.deadline || a.claimedAt) - new Date(b.deadline || b.claimedAt)).map((c) => (
-            <RowLine key={c.id} c={c} action={<Btn small kind="teal" onClick={() => markOne(c)}>Mark received</Btn>} />
+            <RowLine key={c.id} c={c} action={
+              <>
+                <Btn small kind="ghost" onClick={() => openWhatsApp(c.mobile, settings?.waCountryCode, (c.promoted ? waTemplates.promoted : waTemplates.reminder)(c, settings))}>💬</Btn>
+                <Btn small kind="teal" onClick={() => markOne(c)}>Mark received</Btn>
+              </>
+            } />
           ))
         )}
       </Card>
@@ -1588,9 +1859,27 @@ function ReportsTab({ claims, events, actions, me }) {
 /* ---------- Events tab ---------- */
 function EventsTab({ events, claims, actions, me, settings }) {
   const [editing, setEditing] = useState(null); // event object or "new"
+  const [qrEv, setQrEv] = useState(null);
   if (editing) return <EventForm initial={editing === "new" ? null : editing} onDone={() => setEditing(null)} actions={actions} me={me} settings={settings} />;
   return (
     <div>
+      {qrEv && (
+        <div onClick={() => setQrEv(null)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", zIndex: 60, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+          <div onClick={(e) => e.stopPropagation()}>
+            <Card style={{ maxWidth: 380, textAlign: "center" }}>
+              <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 2 }}>{qrEv.title}</div>
+              <div style={{ fontSize: 12, color: C.sub, marginBottom: 10 }}>Scan to open the claim page</div>
+              <img src={qrImg(eventShareUrl(qrEv))} alt="Event QR code" width={260} height={260} style={{ border: `1px solid ${C.line}`, borderRadius: 12, background: "#fff" }} />
+              <div style={{ fontFamily: C.mono, fontSize: 11, color: C.sub, margin: "10px 0", wordBreak: "break-all" }}>{eventShareUrl(qrEv)}</div>
+              <div style={{ fontSize: 12, color: C.sub, marginBottom: 12 }}>Long-press or right-click to save the image — perfect for in-store posters, Discord, and WhatsApp.</div>
+              <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
+                <Btn small kind="teal" onClick={() => window.open(qrImg(eventShareUrl(qrEv), 1000), "_blank", "noopener")}>Open print-size version</Btn>
+                <Btn small kind="ghost" onClick={() => setQrEv(null)}>Close</Btn>
+              </div>
+            </Card>
+          </div>
+        </div>
+      )}
       <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 14 }}>
         <Btn onClick={() => setEditing("new")}>+ Create claim event</Btn>
       </div>
@@ -1620,6 +1909,7 @@ function EventsTab({ events, claims, actions, me, settings }) {
                     } else window.prompt("Copy this share link:", url);
                   }}>Copy share link</Btn>
                 )}
+                {ev.published && <Btn small kind="ghost" onClick={() => setQrEv(ev)}>QR code</Btn>}
                 <Btn small kind="ghost" onClick={() => setEditing(ev)}>Edit</Btn>
                 <Btn small kind={ev.published ? "danger" : "teal"} onClick={() => actions.togglePublish(ev, me.name)}>{ev.published ? "Unpublish" : "Publish"}</Btn>
               </div>
@@ -1637,7 +1927,7 @@ function EventForm({ initial, onDone, actions, me, settings }) {
     initial
       ? { autoExpire: false, autoPromote: false, ...initial, rules: { ...defaultRules(), ...(initial.rules || {}), earlyAccess: { ...defaultRules().earlyAccess, ...((initial.rules || {}).earlyAccess || {}) } } }
       : {
-          id: "ev-" + uid(), title: "", description: "", image: null,
+          id: "ev-" + uid(), title: "", description: "", image: null, hotspots: [],
           products: [{ code: "A1", name: "", price: 0, deposit: settings?.defaultDeposit ?? 10, qty: 1, maxPerCustomer: 0, excludeIfClaimed: "" }],
           opensAt: nowISO(), closesAt: new Date(Date.now() + 48 * 3600e3).toISOString(),
           paymentHours: settings?.defaultPaymentHours ?? 24, waitlist: true,
@@ -1646,7 +1936,17 @@ function EventForm({ initial, onDone, actions, me, settings }) {
         }
   );
   const [msg, setMsg] = useState(null);
+  const [pinCode, setPinCode] = useState("");
   const fileRef = useRef(null);
+
+  const placePin = (e) => {
+    const code = (pinCode || ev.products[0]?.code || "").trim();
+    if (!code) return;
+    const r = e.currentTarget.getBoundingClientRect();
+    const x = Math.round(((e.clientX - r.left) / r.width) * 1000) / 10;
+    const y = Math.round(((e.clientY - r.top) / r.height) * 1000) / 10;
+    setEv((ev) => ({ ...ev, hotspots: [...(ev.hotspots || []).filter((h) => h.code !== code), { code, x, y }] }));
+  };
 
   const setP = (i, k, v) => setEv({ ...ev, products: ev.products.map((p, j) => (j === i ? { ...p, [k]: v } : p)) });
   const addP = () => setEv({ ...ev, products: [...ev.products, { code: "", name: "", price: 0, deposit: settings?.defaultDeposit ?? 10, qty: 1, maxPerCustomer: 0, excludeIfClaimed: "" }] });
@@ -1683,6 +1983,9 @@ function EventForm({ initial, onDone, actions, me, settings }) {
     if (ev.products.some((p) => !p.name)) return setMsg("Every product needs a name.");
     const clean = {
       ...ev,
+      hotspots: (ev.hotspots || [])
+        .map((h) => ({ ...h, code: h.code.trim().toUpperCase() }))
+        .filter((h) => codes.includes(h.code)),
       products: ev.products.map((p) => ({
         ...p,
         code: p.code.trim().toUpperCase(),
@@ -1712,9 +2015,32 @@ function EventForm({ initial, onDone, actions, me, settings }) {
           {ev.image && <img src={ev.image} alt="" style={{ width: 140, borderRadius: 8, border: `1px solid ${C.line}` }} />}
           <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => onFile(e.target.files[0])} />
           <Btn kind="ghost" small onClick={() => fileRef.current.click()}>{ev.image ? "Replace photo" : "Upload photo"}</Btn>
-          {ev.image && <Btn kind="danger" small onClick={() => setEv({ ...ev, image: null })}>Remove</Btn>}
+          {ev.image && <Btn kind="danger" small onClick={() => setEv({ ...ev, image: null, hotspots: [] })}>Remove</Btn>}
         </div>
       </Field>
+
+      {ev.image && (
+        <Field label="Claim pins on the photo (optional)" hint="Pick a code below, then tap that product in the photo to drop its pin. Customers can then tap pins to claim straight from the photo. Tap a placed pin to remove it — one pin per code.">
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 8 }}>
+            <select style={{ ...inputStyle, width: "auto" }} value={pinCode || ev.products[0]?.code || ""} onChange={(e) => setPinCode(e.target.value)}>
+              {ev.products.filter((p) => p.code.trim()).map((p) => <option key={p.code} value={p.code}>{p.code} — {p.name || "unnamed"}</option>)}
+            </select>
+            <span style={{ fontSize: 12, color: C.sub }}>{(ev.hotspots || []).length} pin{(ev.hotspots || []).length === 1 ? "" : "s"} placed</span>
+            {(ev.hotspots || []).length > 0 && <Btn small kind="ghost" onClick={() => setEv({ ...ev, hotspots: [] })}>Clear all pins</Btn>}
+          </div>
+          <div style={{ position: "relative", maxWidth: 560, cursor: "crosshair" }} onClick={placePin}>
+            <img src={ev.image} alt="" style={{ width: "100%", display: "block", borderRadius: 8, border: `1px solid ${C.line}` }} />
+            {(ev.hotspots || []).map((h) => (
+              <button key={h.code}
+                onClick={(e) => { e.stopPropagation(); setEv({ ...ev, hotspots: (ev.hotspots || []).filter((x) => x.code !== h.code) }); }}
+                title="Tap to remove this pin"
+                style={{ position: "absolute", left: `${h.x}%`, top: `${h.y}%`, transform: "translate(-50%, -50%)", background: C.teal, color: "#fff", border: "2px solid #fff", borderRadius: 99, fontFamily: C.mono, fontWeight: 800, fontSize: 12, padding: "4px 9px", cursor: "pointer", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}>
+                {h.code}
+              </button>
+            ))}
+          </div>
+        </Field>
+      )}
 
       <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: C.sub, margin: "16px 0 8px" }}>Products</div>
       <div style={{ overflowX: "auto" }}>
@@ -1981,6 +2307,9 @@ function SettingsTab({ settings, users, actions, me }) {
         </Field>
         <Field label="Deposit payment instructions" hint="Shown to customers with every claim, alongside their unique payment reference.">
           <textarea style={{ ...inputStyle, minHeight: 70 }} value={s.paymentInstructions} onChange={set("paymentInstructions")} />
+        </Field>
+        <Field label="WhatsApp country code" hint="Used for one-tap WhatsApp messages to customers — e.g. 61 for Australia, 44 for UK, 64 for NZ. Local numbers starting with 0 are converted automatically.">
+          <input style={{ ...inputStyle, width: 120 }} value={s.waCountryCode || ""} placeholder="e.g. 61" onChange={set("waCountryCode")} />
         </Field>
         <div style={{ display: "grid", gap: 12, gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))" }}>
           <Field label="Default deposit per item ($)">

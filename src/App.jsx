@@ -1203,6 +1203,7 @@ function AdminApp({ me, users, events, claims, audit, settings, actions }) {
   const pendingCount = users.filter((u) => u.status === "pending").length;
   const tabs = [
     ["claims", `Claims (${claims.length})`],
+    ["reports", "Reports"],
     ["events", `Events (${events.length})`],
     ["customers", `Customers${pendingCount ? ` · ${pendingCount} pending` : ""}`],
     ["audit", "Audit log"],
@@ -1228,6 +1229,7 @@ function AdminApp({ me, users, events, claims, audit, settings, actions }) {
           ))}
         </div>
         {tab === "claims" && <ClaimsTab claims={claims} events={events} actions={actions} me={me} />}
+        {tab === "reports" && <ReportsTab claims={claims} events={events} actions={actions} me={me} />}
         {tab === "events" && <EventsTab events={events} claims={claims} actions={actions} me={me} settings={settings} />}
         {tab === "customers" && <CustomersTab users={users} claims={claims} actions={actions} me={me} />}
         {tab === "audit" && <AuditTab audit={audit} />}
@@ -1249,14 +1251,9 @@ function ClaimsTab({ claims, events, actions, me }) {
   });
 
   const exportCSV = () => {
-    const head = ["Payment ref", "Event", "Code", "Product", "Customer", "Email", "Mobile", "Qty", "Deposit", "Status", "Payment", "Claimed at", "Payment due"];
-    const rows = filtered.map((c) => [c.ref, c.eventTitle, c.code, c.product, c.customer, c.email, c.mobile, c.qty, c.depositTotal, STATUS_META[c.status]?.label || c.status, PAY_META[c.paymentStatus]?.label || c.paymentStatus, c.claimedAt, c.deadline || ""]);
-    const esc = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
-    const csv = [head, ...rows].map((r) => r.map(esc).join(",")).join("\n");
-    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
-    const a = document.createElement("a");
-    a.href = url; a.download = "claims-export.csv"; a.click();
-    URL.revokeObjectURL(url);
+    const head = ["Payment ref", "Event", "Code", "Product", "Customer", "Email", "Mobile", "Qty", "Deposit", "Status", "Payment", "Claimed at", "Payment due", "Deposit received at", "Received by"];
+    const rows = filtered.map((c) => [c.ref, c.eventTitle, c.code, c.product, c.customer, c.email, c.mobile, c.qty, c.depositTotal, STATUS_META[c.status]?.label || c.status, PAY_META[c.paymentStatus]?.label || c.paymentStatus, c.claimedAt, c.deadline || "", c.payReceivedAt || "", c.payReceivedBy || ""]);
+    downloadCSV("claims-export.csv", head, rows);
   };
 
   const totals = {
@@ -1330,7 +1327,7 @@ function AdminClaimRow({ c, ev, claims, actions, me }) {
       <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap" }}>
         {c.status === "awaiting_deposit" && (
           <Btn small kind="teal" onClick={A(
-            { status: "deposit_received", paymentStatus: "received", ...(overdue ? { paidLate: true } : {}) },
+            { status: "deposit_received", paymentStatus: "received", payReceivedAt: nowISO(), payReceivedBy: me.name, ...(overdue ? { paidLate: true } : {}) },
             overdue ? "Deposit received (late)" : "Deposit marked received"
           )}>Mark deposit received</Btn>
         )}
@@ -1353,6 +1350,238 @@ function AdminClaimRow({ c, ev, claims, actions, me }) {
         )}
       </div>
     </Card>
+  );
+}
+
+/* ---------- Reports & reconciliation tab ---------- */
+const normRef = (s) => String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+
+function downloadCSV(filename, head, rows) {
+  const esc = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const csv = [head, ...rows].map((r) => r.map(esc).join(",")).join("\n");
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+  const a = document.createElement("a");
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+function StatCard({ label, value, sub, color }) {
+  return (
+    <Card style={{ padding: "12px 16px", flex: 1, minWidth: 150 }}>
+      <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: C.sub }}>{label}</div>
+      <div style={{ fontSize: 22, fontWeight: 800, color: color || C.ink, marginTop: 2 }}>{value}</div>
+      {sub && <div style={{ fontSize: 12, color: C.sub }}>{sub}</div>}
+    </Card>
+  );
+}
+
+function ReportsTab({ claims, events, actions, me }) {
+  const [eventF, setEventF] = useState("all");
+  const [range, setRange] = useState("7");
+  const [paste, setPaste] = useState("");
+  const [matchResult, setMatchResult] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const inEvent = (c) => eventF === "all" || c.eventId === eventF;
+  const scoped = claims.filter(inEvent);
+
+  const outstanding = scoped.filter((c) => c.paymentStatus === "awaiting" && HOLDS_STOCK.includes(c.status));
+  const overdueList = outstanding.filter((c) => c.deadline && new Date(c.deadline) < Date.now());
+  const readyList = scoped.filter((c) => c.status === "ready");
+  const received = scoped.filter((c) => c.paymentStatus === "received");
+
+  const receivedDate = (c) => c.payReceivedAt || c.claimedAt; // older records lack the received stamp
+  const cutoff = Date.now() - Number(range) * 86400e3;
+  const receivedInRange = range === "all" ? received : received.filter((c) => new Date(receivedDate(c)).getTime() >= cutoff);
+
+  const sums = {
+    outstanding: outstanding.reduce((s, c) => s + c.depositTotal, 0),
+    received: receivedInRange.reduce((s, c) => s + c.depositTotal, 0),
+  };
+
+  /* ----- reference matcher ----- */
+  const runMatch = () => {
+    const blob = normRef(paste);
+    if (!blob) return;
+    const lines = paste.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+    const matched = [], already = [], attention = [];
+    for (const c of claims) {
+      if (!c.ref || !blob.includes(normRef(c.ref))) continue;
+      if (c.paymentStatus === "received") already.push(c);
+      else if (c.status === "awaiting_deposit") matched.push(c);
+      else attention.push(c); // expired, cancelled, waitlisted etc — needs a human decision
+    }
+    const known = [...matched, ...already, ...attention];
+    const unknown = lines.filter((l) => normRef(l) && !known.some((c) => normRef(l).includes(normRef(c.ref))));
+    setMatchResult({ matched, already, attention, unknown });
+  };
+
+  const confirmMatched = async () => {
+    if (!matchResult?.matched?.length) return;
+    setBusy(true);
+    for (const c of matchResult.matched) {
+      const late = c.deadline && new Date(c.deadline) < Date.now();
+      await actions.updateClaim(
+        c,
+        { status: "deposit_received", paymentStatus: "received", payReceivedAt: nowISO(), payReceivedBy: me.name, reconciled: true, ...(late ? { paidLate: true } : {}) },
+        me.name,
+        late ? "Deposit reconciled (late)" : "Deposit reconciled"
+      );
+    }
+    setBusy(false);
+    setMatchResult(null);
+    setPaste("");
+  };
+
+  const markOne = (c) => {
+    const late = c.deadline && new Date(c.deadline) < Date.now();
+    actions.updateClaim(
+      c,
+      { status: "deposit_received", paymentStatus: "received", payReceivedAt: nowISO(), payReceivedBy: me.name, ...(late ? { paidLate: true } : {}) },
+      me.name,
+      late ? "Deposit received (late)" : "Deposit marked received"
+    );
+  };
+
+  /* ----- one-click report exports ----- */
+  const stamp = new Date().toISOString().slice(0, 10);
+  const exportOutstanding = () =>
+    downloadCSV(`outstanding-deposits-${stamp}.csv`,
+      ["Payment ref", "Customer", "Email", "Mobile", "Event", "Code", "Product", "Qty", "Deposit due", "Claimed at", "Payment deadline", "Overdue"],
+      outstanding.map((c) => [c.ref, c.customer, c.email, c.mobile, c.eventTitle, c.code, c.product, c.qty, c.depositTotal, c.claimedAt, c.deadline || "", c.deadline && new Date(c.deadline) < Date.now() ? "YES" : ""]));
+  const exportReceived = () =>
+    downloadCSV(`deposits-received-${stamp}.csv`,
+      ["Payment ref", "Customer", "Event", "Code", "Product", "Qty", "Amount", "Received at", "Received by", "Paid late", "Claim status"],
+      receivedInRange.map((c) => [c.ref, c.customer, c.eventTitle, c.code, c.product, c.qty, c.depositTotal, c.payReceivedAt || "(before tracking)", c.payReceivedBy || "", c.paidLate ? "YES" : "", STATUS_META[c.status]?.label || c.status]));
+  const exportPickList = () =>
+    downloadCSV(`collection-pick-list-${stamp}.csv`,
+      ["Code", "Product", "Qty", "Customer", "Mobile", "Payment ref", "Deposit paid", "Event"],
+      readyList.map((c) => [c.code, c.product, c.qty, c.customer, c.mobile, c.ref, c.depositTotal, c.eventTitle]));
+  const exportEventSummary = () =>
+    downloadCSV(`event-summary-${stamp}.csv`,
+      ["Event", "Total claims", "Active", "Waitlisted", "Collected", "Deposits expected", "Deposits received", "Outstanding"],
+      events.map((ev) => {
+        const ec = claims.filter((c) => c.eventId === ev.id);
+        const act = ec.filter((c) => HOLDS_STOCK.includes(c.status));
+        const rec = ec.filter((c) => c.paymentStatus === "received").reduce((s, c) => s + c.depositTotal, 0);
+        const out = ec.filter((c) => c.paymentStatus === "awaiting" && HOLDS_STOCK.includes(c.status)).reduce((s, c) => s + c.depositTotal, 0);
+        return [ev.title, ec.length, act.length, ec.filter((c) => c.status === "waitlisted").length, ec.filter((c) => c.status === "collected").length, rec + out, rec, out];
+      }));
+
+  const RowLine = ({ c, action }) => {
+    const overdue = c.deadline && new Date(c.deadline) < Date.now();
+    return (
+      <div style={{ display: "flex", gap: 10, alignItems: "center", padding: "8px 12px", borderBottom: `1px solid ${C.line}`, fontSize: 13, flexWrap: "wrap" }}>
+        <span style={{ fontFamily: C.mono, fontWeight: 700, whiteSpace: "nowrap" }}>{c.ref}</span>
+        <span style={{ flex: 1, minWidth: 140 }}><b>{c.customer}</b> <span style={{ color: C.sub }}>· {c.code} {c.product} ×{c.qty}</span></span>
+        <b>{money(c.depositTotal)}</b>
+        {c.deadline && c.paymentStatus === "awaiting" && <span style={{ color: overdue ? C.red : C.amber, fontWeight: 700, fontSize: 12 }}>{timeLeft(c.deadline)}</span>}
+        {action}
+      </div>
+    );
+  };
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 10, marginBottom: 14, flexWrap: "wrap", alignItems: "center" }}>
+        <select style={{ ...inputStyle, width: "auto" }} value={eventF} onChange={(e) => setEventF(e.target.value)}>
+          <option value="all">All events</option>
+          {events.map((e) => <option key={e.id} value={e.id}>{e.title}</option>)}
+        </select>
+        <select style={{ ...inputStyle, width: "auto" }} value={range} onChange={(e) => setRange(e.target.value)}>
+          <option value="1">Received: today</option>
+          <option value="7">Received: last 7 days</option>
+          <option value="30">Received: last 30 days</option>
+          <option value="all">Received: all time</option>
+        </select>
+      </div>
+
+      <div style={{ display: "flex", gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
+        <StatCard label="Outstanding deposits" value={money(sums.outstanding)} sub={`${outstanding.length} claim${outstanding.length === 1 ? "" : "s"} awaiting payment`} color={C.amber} />
+        <StatCard label="Overdue" value={overdueList.length} sub="past payment deadline" color={overdueList.length ? C.red : C.ink} />
+        <StatCard label="Deposits received" value={money(sums.received)} sub={`${receivedInRange.length} in selected period`} color={C.teal} />
+        <StatCard label="Ready for collection" value={readyList.length} sub="waiting at the counter" />
+      </div>
+
+      {/* ----- Reconciliation matcher ----- */}
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ fontWeight: 800, marginBottom: 4 }}>Reconcile bank deposits</div>
+        <div style={{ fontSize: 13, color: C.sub, marginBottom: 10 }}>
+          Paste one or more payment references from your bank statement — whole statement lines are fine. Matching claims are found automatically (dashes, spaces, and case don't matter), and one click marks them all received.
+        </div>
+        <textarea
+          style={{ ...inputStyle, width: "100%", minHeight: 80, fontFamily: C.mono, fontSize: 13, boxSizing: "border-box" }}
+          placeholder={"e.g.\n14 JUL TRANSFER CLM-A2-7F3K J SMITH  $20.00\nCLM-B1-9XQ2"}
+          value={paste}
+          onChange={(e) => { setPaste(e.target.value); setMatchResult(null); }}
+        />
+        <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+          <Btn kind="teal" small onClick={runMatch} disabled={!paste.trim()}>Find matches</Btn>
+          {matchResult && matchResult.matched.length > 0 && (
+            <Btn kind="teal" small onClick={confirmMatched} disabled={busy}>
+              {busy ? "Marking…" : `Mark ${matchResult.matched.length} deposit${matchResult.matched.length === 1 ? "" : "s"} received (${money(matchResult.matched.reduce((s, c) => s + c.depositTotal, 0))})`}
+            </Btn>
+          )}
+        </div>
+        {matchResult && (
+          <div style={{ marginTop: 12 }}>
+            {matchResult.matched.length > 0 && (
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: C.teal, marginBottom: 4 }}>✓ Ready to mark received ({matchResult.matched.length})</div>
+                <div style={{ border: `1px solid ${C.line}`, borderRadius: 10, overflow: "hidden" }}>
+                  {matchResult.matched.map((c) => <RowLine key={c.id} c={c} />)}
+                </div>
+              </div>
+            )}
+            {matchResult.already.length > 0 && (
+              <div style={{ fontSize: 12, color: C.sub, marginBottom: 6 }}>
+                Already marked received: {matchResult.already.map((c) => c.ref).join(", ")}
+              </div>
+            )}
+            {matchResult.attention.length > 0 && (
+              <div style={{ fontSize: 12, color: C.red, fontWeight: 600, marginBottom: 6 }}>
+                Needs attention (claim no longer awaiting deposit): {matchResult.attention.map((c) => `${c.ref} — ${STATUS_META[c.status]?.label || c.status}`).join("; ")}. Handle these from the Claims tab.
+              </div>
+            )}
+            {matchResult.unknown.length > 0 && (
+              <div style={{ fontSize: 12, color: C.amber }}>
+                No claim reference found in {matchResult.unknown.length} line{matchResult.unknown.length === 1 ? "" : "s"}: {matchResult.unknown.slice(0, 5).join(" · ")}{matchResult.unknown.length > 5 ? " …" : ""}
+              </div>
+            )}
+            {matchResult.matched.length + matchResult.already.length + matchResult.attention.length === 0 && (
+              <div style={{ fontSize: 13, color: C.sub }}>No payment references matched. Check the reference format (e.g. CLM-A2-7F3K).</div>
+            )}
+          </div>
+        )}
+      </Card>
+
+      {/* ----- Outstanding list ----- */}
+      <Card style={{ marginBottom: 16, padding: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "12px 16px", borderBottom: `1px solid ${C.line}` }}>
+          <div style={{ fontWeight: 800, flex: 1 }}>Awaiting deposits ({outstanding.length})</div>
+          <Btn kind="ghost" small onClick={exportOutstanding} disabled={!outstanding.length}>Export CSV</Btn>
+        </div>
+        {outstanding.length === 0 ? (
+          <div style={{ padding: 16, fontSize: 13, color: C.sub }}>Nothing outstanding — all deposits are in. 🎉</div>
+        ) : (
+          [...outstanding].sort((a, b) => new Date(a.deadline || a.claimedAt) - new Date(b.deadline || b.claimedAt)).map((c) => (
+            <RowLine key={c.id} c={c} action={<Btn small kind="teal" onClick={() => markOne(c)}>Mark received</Btn>} />
+          ))
+        )}
+      </Card>
+
+      {/* ----- Report downloads ----- */}
+      <Card>
+        <div style={{ fontWeight: 800, marginBottom: 4 }}>One-click reports</div>
+        <div style={{ fontSize: 13, color: C.sub, marginBottom: 10 }}>Ready-made CSVs — no filters to set up. Respect the event selected above.</div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <Btn kind="ghost" small onClick={exportReceived} disabled={!receivedInRange.length}>Deposits received ({receivedInRange.length})</Btn>
+          <Btn kind="ghost" small onClick={exportOutstanding} disabled={!outstanding.length}>Outstanding deposits ({outstanding.length})</Btn>
+          <Btn kind="ghost" small onClick={exportPickList} disabled={!readyList.length}>Collection pick list ({readyList.length})</Btn>
+          <Btn kind="ghost" small onClick={exportEventSummary} disabled={!events.length}>Per-event summary ({events.length})</Btn>
+        </div>
+      </Card>
+    </div>
   );
 }
 

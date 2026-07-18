@@ -1734,6 +1734,41 @@ function ReportsTab({ claims, events, actions, me, settings }) {
         return [ev.title, ec.length, act.length, ec.filter((c) => c.status === "waitlisted").length, ec.filter((c) => c.status === "collected").length, rec + out, rec, out];
       }));
 
+  /* ----- product allocation: who ordered what, in what quantity ----- */
+  const relevantEvents = events.filter((ev) => eventF === "all" || ev.id === eventF);
+  const allocation = relevantEvents.map((ev) => ({
+    ev,
+    products: ev.products.map((p) => {
+      const lines = claims
+        .filter((c) => c.eventId === ev.id && c.code === p.code && HOLDS_STOCK.includes(c.status))
+        .sort((a, b) => new Date(a.claimedAt) - new Date(b.claimedAt));
+      const waiting = waitlistQueue(claims, ev.id, p.code);
+      const claimedQty = lines.reduce((s, c) => s + c.qty, 0);
+      return { p, lines, waiting, claimedQty };
+    }),
+  }));
+
+  const exportAllocation = () =>
+    downloadCSV(`product-allocation-${stamp}.csv`,
+      ["Event", "Code", "Product", "Customer", "Email", "Mobile", "Qty ordered", "Claim status", "Payment", "Deposit", "Payment ref", "Claimed at"],
+      allocation.flatMap(({ ev, products }) =>
+        products.flatMap(({ p, lines, waiting }) => [
+          ...lines.map((c) => [ev.title, p.code, p.name, c.customer, c.email, c.mobile, c.qty, STATUS_META[c.status]?.label || c.status, PAY_META[c.paymentStatus]?.label || c.paymentStatus, c.depositTotal, c.ref, c.claimedAt]),
+          ...waiting.map((c) => [ev.title, p.code, p.name, c.customer, c.email, c.mobile, c.qty, "Waitlisted", "—", c.depositTotal, c.ref, c.claimedAt]),
+        ])
+      ));
+
+  const exportProductTotals = () =>
+    downloadCSV(`product-totals-${stamp}.csv`,
+      ["Event", "Code", "Product", "Qty available", "Qty ordered", "Qty remaining", "Customers", "Qty collected", "Qty waitlisted"],
+      allocation.flatMap(({ ev, products }) =>
+        products.map(({ p, lines, waiting, claimedQty }) => [
+          ev.title, p.code, p.name, p.qty, claimedQty, Math.max(0, p.qty - claimedQty), lines.length,
+          lines.filter((c) => c.status === "collected").reduce((s, c) => s + c.qty, 0),
+          waiting.reduce((s, c) => s + c.qty, 0),
+        ])
+      ));
+
   const RowLine = ({ c, action }) => {
     const overdue = c.deadline && new Date(c.deadline) < Date.now();
     return (
@@ -1841,11 +1876,59 @@ function ReportsTab({ claims, events, actions, me, settings }) {
         )}
       </Card>
 
+      {/* ----- Product allocation: who ordered what ----- */}
+      <Card style={{ marginBottom: 16, padding: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "12px 16px", borderBottom: `1px solid ${C.line}` }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 800 }}>Product allocation</div>
+            <div style={{ fontSize: 12, color: C.sub }}>Exactly who ordered what, and in what quantity — for pulling stock and packing orders.</div>
+          </div>
+          <Btn kind="ghost" small onClick={exportAllocation}>Export detail CSV</Btn>
+          <Btn kind="ghost" small onClick={exportProductTotals}>Export totals CSV</Btn>
+        </div>
+        {allocation.every(({ products }) => products.every(({ lines, waiting }) => lines.length === 0 && waiting.length === 0)) ? (
+          <div style={{ padding: 16, fontSize: 13, color: C.sub }}>No orders yet for {eventF === "all" ? "any event" : "this event"}.</div>
+        ) : (
+          allocation.map(({ ev, products }) =>
+            products.filter(({ lines, waiting }) => lines.length > 0 || waiting.length > 0).map(({ p, lines, waiting, claimedQty }) => (
+              <div key={ev.id + p.code} style={{ borderBottom: `1px solid ${C.line}` }}>
+                <div style={{ display: "flex", gap: 10, alignItems: "center", padding: "10px 16px", background: C.bg, flexWrap: "wrap" }}>
+                  <Tag code={p.code} size="sm" />
+                  <b style={{ flex: 1, minWidth: 140, fontSize: 14 }}>{p.name}</b>
+                  {eventF === "all" && <span style={{ fontSize: 12, color: C.sub }}>{ev.title}</span>}
+                  <span style={{ fontSize: 13, fontWeight: 800, color: claimedQty >= p.qty ? C.red : C.teal }}>
+                    {claimedQty} of {p.qty} ordered
+                  </span>
+                  {waiting.length > 0 && <span style={{ fontSize: 12, fontWeight: 700, color: "#5B4A8A" }}>+{waiting.reduce((s, c) => s + c.qty, 0)} waitlisted</span>}
+                </div>
+                {lines.map((c) => (
+                  <div key={c.id} style={{ display: "flex", gap: 10, alignItems: "center", padding: "7px 16px 7px 28px", fontSize: 13, flexWrap: "wrap" }}>
+                    <span style={{ fontFamily: C.mono, fontWeight: 800, minWidth: 34 }}>×{c.qty}</span>
+                    <span style={{ flex: 1, minWidth: 140 }}><b>{c.customer}</b> <span style={{ color: C.sub, fontFamily: C.mono, fontSize: 12 }}>· {c.ref}</span></span>
+                    <Chip s={c.status} />
+                    <PayChip p={c.paymentStatus} />
+                  </div>
+                ))}
+                {waiting.map((c, i) => (
+                  <div key={c.id} style={{ display: "flex", gap: 10, alignItems: "center", padding: "7px 16px 7px 28px", fontSize: 13, flexWrap: "wrap", opacity: 0.75 }}>
+                    <span style={{ fontFamily: C.mono, fontWeight: 800, minWidth: 34 }}>×{c.qty}</span>
+                    <span style={{ flex: 1, minWidth: 140 }}><b>{c.customer}</b> <span style={{ color: C.sub, fontSize: 12 }}>· waitlist #{i + 1}</span></span>
+                    <Chip s="waitlisted" />
+                  </div>
+                ))}
+              </div>
+            ))
+          )
+        )}
+      </Card>
+
       {/* ----- Report downloads ----- */}
       <Card>
         <div style={{ fontWeight: 800, marginBottom: 4 }}>One-click reports</div>
         <div style={{ fontSize: 13, color: C.sub, marginBottom: 10 }}>Ready-made CSVs — no filters to set up. Respect the event selected above.</div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <Btn kind="ghost" small onClick={exportAllocation}>Product allocation (who × what)</Btn>
+          <Btn kind="ghost" small onClick={exportProductTotals}>Product totals (stock count)</Btn>
           <Btn kind="ghost" small onClick={exportReceived} disabled={!receivedInRange.length}>Deposits received ({receivedInRange.length})</Btn>
           <Btn kind="ghost" small onClick={exportOutstanding} disabled={!outstanding.length}>Outstanding deposits ({outstanding.length})</Btn>
           <Btn kind="ghost" small onClick={exportPickList} disabled={!readyList.length}>Collection pick list ({readyList.length})</Btn>

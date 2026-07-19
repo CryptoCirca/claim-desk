@@ -2294,11 +2294,16 @@ function CustomersTab({ users, claims, actions, me }) {
 
 /* ---------- Settings & staff tab (Super Admin only) ---------- */
 function SettingsTab({ settings, users, actions, me }) {
-  const [s, setS] = useState(settings);
-  useEffect(() => setS(settings), [settings]);
+  const [s, rawSetS] = useState(settings);
+  const [dirty, setDirty] = useState(false);
+  // Background sync refreshes `settings` every ~12s. Only mirror it into the
+  // draft when there are no unsaved edits — otherwise typing gets wiped.
+  useEffect(() => { if (!dirty) rawSetS(settings); }, [settings, dirty]);
+  const setS = (v) => { setDirty(true); rawSetS(v); };
   const set = (k) => (e) => setS({ ...s, [k]: e.target.value });
   const setD = (k, v) => setS({ ...s, delivery: { ...s.delivery, [k]: v } });
   const setNotif = (k) => (e) => setS({ ...s, notif: { ...s.notif, [k]: e.target.checked } });
+  const save = async () => { await actions.saveSettings(s, me.name); setDirty(false); };
 
   const staff = users.filter((u) => isStaffRole(u.role));
   const [nf, setNf] = useState({ name: "", email: "", mobile: "", pin: "", role: "claimadmin" });
@@ -2380,7 +2385,7 @@ function SettingsTab({ settings, users, actions, me }) {
             </button>
           ))}
         </div>
-        <Btn onClick={() => actions.saveSettings(s, me.name)}>Save branding</Btn>
+        <Btn onClick={save}>Save branding</Btn>
       </Card>
 
       <Card>
@@ -2455,7 +2460,7 @@ function SettingsTab({ settings, users, actions, me }) {
             </label>
           ))}
         </div>
-        <div style={{ marginTop: 14 }}><Btn onClick={() => actions.saveSettings(s, me.name)}>Save settings</Btn></div>
+        <div style={{ marginTop: 14 }}><Btn onClick={save}>Save settings</Btn>{dirty && <span style={{ marginLeft: 10, fontSize: 12, color: C.amber, fontWeight: 700 }}>Unsaved changes</span>}</div>
       </Card>
 
       <Card>

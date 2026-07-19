@@ -301,6 +301,14 @@ const defaultRules = () => ({
 // Checks whether a customer may claim this product right now.
 // Returns { ok: true, maxQty } or { ok: false, msg }.
 function claimEligibility(user, ev, product, claims) {
+  // Hard timing gate — enforced here so it applies to every path that can
+  // place a claim (event page, share links, hotspot pins), not just the UI.
+  if (!ev.published) return { ok: false, msg: "This event isn't open for claims." };
+  const nowT = Date.now();
+  if (nowT < new Date(ev.opensAt).getTime())
+    return { ok: false, msg: `Claims open ${fmtDT(ev.opensAt)}` };
+  if (nowT >= new Date(ev.closesAt).getTime())
+    return { ok: false, msg: "Claims for this event have closed." };
   const rules = { ...defaultRules(), ...(ev.rules || {}) };
   const group = user.group || "standard";
   if (rules.earlyAccess && rules.earlyAccess.enabled) {
@@ -1213,6 +1221,16 @@ function EventDetail({ ev, me, claims, settings, actions, onBack, goClaims }) {
   const [qty, setQty] = useState(1);
   const [placed, setPlaced] = useState(null);
   const [err, setErr] = useState(null);
+  const live = isOpen(ev);
+  const notYetOpen = ev.published && new Date(ev.opensAt) > Date.now();
+  // tick every second while waiting to open, so the countdown runs and the
+  // claim buttons unlock at the exact moment the event goes live
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (!notYetOpen) return;
+    const t = setInterval(() => tick((x) => x + 1), 1000);
+    return () => clearInterval(t);
+  }, [notYetOpen]);
 
   const product = sel ? ev.products.find((p) => p.code === sel) : null;
   const avail = product ? Math.max(0, product.qty - heldQty(claims, ev.id, product.code)) : 0;
@@ -1239,6 +1257,11 @@ function EventDetail({ ev, me, claims, settings, actions, onBack, goClaims }) {
       <a onClick={onBack} style={{ color: C.teal, fontWeight: 600, fontSize: 14, cursor: "pointer" }}>← All events</a>
       <div style={{ display: "grid", gap: 18, gridTemplateColumns: "1fr", marginTop: 12 }}>
         <Card style={{ padding: 0, overflow: "hidden" }}>
+          {notYetOpen && (
+            <div style={{ padding: "12px 16px", background: C.amberSoft, borderBottom: `1px solid ${C.line}`, fontSize: 14, fontWeight: 700, color: C.amber }}>
+              Claims open in {countdown(ev.opensAt) || "moments"} — {fmtDT(ev.opensAt)}. You can browse the products now, but claiming is locked until then.
+            </div>
+          )}
           <PhotoWithPins ev={ev} claims={claims} onPick={pickCode} />
           <div style={{ padding: 16 }}>
             <div style={{ fontSize: 20, fontWeight: 800 }}>{ev.title}</div>
@@ -1272,6 +1295,7 @@ function EventDetail({ ev, me, claims, settings, actions, onBack, goClaims }) {
           {(() => {
             const r = { ...defaultRules(), ...(ev.rules || {}) };
             if (!r.earlyAccess.enabled) return null;
+            if (Date.now() < new Date(ev.opensAt).getTime()) return null;
             const end = new Date(ev.opensAt).getTime() + (+r.earlyAccess.minutes || 0) * 60000;
             if (Date.now() >= end) return null;
             const names = (r.earlyAccess.groups || []).map((g) => CUSTOMER_GROUPS[g] || g).join(" & ");

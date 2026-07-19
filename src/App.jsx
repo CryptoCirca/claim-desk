@@ -689,6 +689,34 @@ export default function App() {
       await addAudit(user.name, "Registered", `${user.email} — pending approval`);
       return { ok: true, user };
     },
+    async updateProfile(user, patch) {
+      let cur = await loadKey(K.users, []);
+      if (!Array.isArray(cur) || cur.length === 0) cur = users;
+      const newEmail = (patch.email ?? user.email).trim();
+      if (!newEmail || !(patch.name ?? user.name) || !(patch.mobile ?? user.mobile))
+        return { ok: false, msg: "Name, email, and mobile can't be empty." };
+      if (cur.some((u) => u.id !== user.id && u.email.toLowerCase() === newEmail.toLowerCase()))
+        return { ok: false, msg: "That email is already used by another account." };
+      if (patch.pin !== undefined && String(patch.pin).length < 4)
+        return { ok: false, msg: "Your new PIN needs at least 4 digits." };
+      const next = cur.map((u) => (u.id === user.id ? { ...u, ...patch, email: newEmail } : u));
+      await saveKey(K.users, next);
+      setUsers(next);
+      // Keep contact details current on claims that are still in play, so staff
+      // reminders and WhatsApp messages reach the right person.
+      const cl = await loadKey(K.claims, []);
+      const done = ["cancelled", "expired", "collected"];
+      const nextCl = (Array.isArray(cl) ? cl : []).map((c) =>
+        c.userId === user.id && !done.includes(c.status)
+          ? { ...c, customer: patch.name ?? c.customer, email: newEmail, mobile: patch.mobile ?? c.mobile }
+          : c
+      );
+      await saveKey(K.claims, nextCl);
+      setClaims(nextCl);
+      const changed = ["name", "email", "mobile"].filter((k) => patch[k] !== undefined && patch[k] !== user[k]);
+      await addAudit(patch.name ?? user.name, "Profile updated", [...changed, ...(patch.pin !== undefined ? ["PIN changed"] : [])].join(", ") || "No changes");
+      return { ok: true };
+    },
     async login(email, pin) {
       let cur = await loadKey(K.users, []);
       if (!Array.isArray(cur) || cur.length === 0) cur = users.length ? users : seedData().users;
@@ -1139,7 +1167,7 @@ function CustomerApp({ me, events, claims, settings, actions, initialEventId }) 
       />
       <div style={{ maxWidth: 1080, margin: "0 auto", padding: 20 }}>
         <div style={{ display: "flex", gap: 8, marginBottom: 18 }}>
-          {[["events", "Claim events"], ["claims", `My claims (${mine.length})`]].map(([k, l]) => (
+          {[["events", "Claim events"], ["claims", `My claims (${mine.length})`], ["account", "My account"]].map(([k, l]) => (
             <button key={k} onClick={() => { setTab(k); setOpenEvent(null); }} style={{ padding: "8px 16px", borderRadius: 99, border: "none", cursor: "pointer", fontWeight: 600, fontSize: 14, background: tab === k ? C.ink : "transparent", color: tab === k ? "#F1EFE9" : C.sub }}>{l}</button>
           ))}
         </div>
@@ -1155,6 +1183,7 @@ function CustomerApp({ me, events, claims, settings, actions, initialEventId }) 
         )}
         {tab === "events" && ev && <EventDetail ev={ev} me={me} claims={claims} settings={settings} actions={actions} onBack={() => setOpenEvent(null)} goClaims={() => setTab("claims")} />}
         {tab === "claims" && <MyClaims mine={mine} claims={claims} settings={settings} actions={actions} me={me} />}
+        {tab === "account" && <MyAccount me={me} actions={actions} />}
       </div>
     </>
   );
@@ -1304,6 +1333,78 @@ function EventDetail({ ev, me, claims, settings, actions, onBack, goClaims }) {
           })}
         </Card>
       </div>
+    </div>
+  );
+}
+
+/* ---------- customer account settings ---------- */
+function MyAccount({ me, actions }) {
+  const [f, setF] = useState({ name: me.name, email: me.email, mobile: me.mobile });
+  const [pinF, setPinF] = useState({ current: "", next: "", confirm: "" });
+  const [msg, setMsg] = useState(null);
+  const [pinMsg, setPinMsg] = useState(null);
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const dirty = f.name !== me.name || f.email !== me.email || f.mobile !== me.mobile;
+
+  const saveDetails = async () => {
+    setMsg(null);
+    const r = await actions.updateProfile(me, { name: f.name.trim(), email: f.email.trim(), mobile: f.mobile.trim() });
+    setMsg(r.ok ? { ok: true, text: "Your details have been updated." } : { ok: false, text: r.msg });
+  };
+
+  const savePin = async () => {
+    setPinMsg(null);
+    if (pinF.current !== me.pin) return setPinMsg({ ok: false, text: "Your current PIN doesn't match." });
+    if (pinF.next.length < 4) return setPinMsg({ ok: false, text: "Your new PIN needs at least 4 digits." });
+    if (pinF.next !== pinF.confirm) return setPinMsg({ ok: false, text: "The new PINs don't match." });
+    const r = await actions.updateProfile(me, { pin: pinF.next });
+    if (r.ok) { setPinF({ current: "", next: "", confirm: "" }); setPinMsg({ ok: true, text: "PIN changed. Use it next time you sign in." }); }
+    else setPinMsg({ ok: false, text: r.msg });
+  };
+
+  const note = (m) => m && (
+    <div style={{ marginTop: 10, fontSize: 13, fontWeight: 600, color: m.ok ? C.teal : C.red }}>{m.text}</div>
+  );
+
+  return (
+    <div style={{ maxWidth: 520 }}>
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ fontWeight: 800, marginBottom: 4 }}>My details</div>
+        <div style={{ fontSize: 13, color: C.sub, marginBottom: 14 }}>
+          These are the details the store uses to contact you about your claims.
+        </div>
+        <Field label="Name"><input style={inputStyle} value={f.name} onChange={set("name")} /></Field>
+        <Field label="Email" hint="You sign in with this email."><input style={inputStyle} value={f.email} onChange={set("email")} /></Field>
+        <Field label="Mobile" hint="Used for payment reminders and collection messages."><input style={inputStyle} value={f.mobile} onChange={set("mobile")} /></Field>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 4 }}>
+          <Btn onClick={saveDetails} disabled={!dirty}>Save details</Btn>
+          {dirty && <Btn kind="ghost" small onClick={() => { setF({ name: me.name, email: me.email, mobile: me.mobile }); setMsg(null); }}>Discard</Btn>}
+        </div>
+        {note(msg)}
+      </Card>
+
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ fontWeight: 800, marginBottom: 4 }}>Change PIN</div>
+        <div style={{ fontSize: 13, color: C.sub, marginBottom: 14 }}>Your PIN is what you sign in with, so keep it to yourself.</div>
+        <Field label="Current PIN"><input style={inputStyle} type="password" inputMode="numeric" value={pinF.current} onChange={(e) => setPinF({ ...pinF, current: e.target.value })} /></Field>
+        <div style={{ display: "grid", gap: 12, gridTemplateColumns: "1fr 1fr" }}>
+          <Field label="New PIN"><input style={inputStyle} type="password" inputMode="numeric" value={pinF.next} onChange={(e) => setPinF({ ...pinF, next: e.target.value })} /></Field>
+          <Field label="Confirm new PIN"><input style={inputStyle} type="password" inputMode="numeric" value={pinF.confirm} onChange={(e) => setPinF({ ...pinF, confirm: e.target.value })} /></Field>
+        </div>
+        <Btn onClick={savePin} disabled={!pinF.current || !pinF.next || !pinF.confirm}>Change PIN</Btn>
+        {note(pinMsg)}
+      </Card>
+
+      <Card>
+        <div style={{ fontWeight: 800, marginBottom: 10 }}>Membership</div>
+        <div style={{ fontSize: 13, color: C.sub, display: "grid", gap: 6 }}>
+          <div>Customer group: <b style={{ color: C.ink }}>{CUSTOMER_GROUPS[me.group] || "Standard"}</b></div>
+          <div>Member since: <b style={{ color: C.ink }}>{fmtDT(me.createdAt)}</b></div>
+        </div>
+        <div style={{ fontSize: 12, color: C.sub, marginTop: 10 }}>
+          Your group and standing are managed by the store — ask staff if anything looks off.
+        </div>
+      </Card>
     </div>
   );
 }
